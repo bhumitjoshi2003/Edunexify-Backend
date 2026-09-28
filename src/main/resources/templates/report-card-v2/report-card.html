@@ -1,0 +1,246 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:th="http://www.thymeleaf.org" lang="en">
+<head>
+<meta charset="UTF-8"/>
+<title th:text="${vm.title()}">Report Card</title>
+<style>
+  /* Report Card V2 — one canonical A4 document. Laid out by OpenHTMLtoPDF (CSS 2.1 + paged media).
+     Readable minimums: body 9.5pt, table 9pt, footer 7pt. Long cards move to a second page
+     instead of shrinking further. */
+  @page {
+    size: A4;
+    margin: 11mm 11mm 38mm 11mm;
+    @top-right { content: "Page " counter(page) " of " counter(pages); font-family: 'Noto Sans'; font-size: 7pt; color: #6b7280; }
+    @bottom-center { content: element(signatures); vertical-align: top; }
+  }
+  /* Split cards: the academic pages carry no signature block; it sits on the final page. */
+  @page academic {
+    margin-bottom: 13mm;
+    @bottom-center { content: none; }
+  }
+
+  body { font-family: 'Noto Sans Devanagari', 'Noto Sans'; font-size: 9.5pt; color: #1f2937; margin: 0; line-height: 1.3; }
+  .split .academic { page: academic; }
+  .page-break { page-break-before: always; }
+
+  /* Header */
+  .header { text-align: center; border-bottom: 1.6pt solid #1e3a5f; padding-bottom: 5pt; margin-bottom: 5pt; }
+  .header-image { width: 100%; max-height: 26mm; }
+  .logo { height: 16mm; margin-bottom: 2pt; }
+  .school { font-size: 16pt; font-weight: bold; color: #1e3a5f; letter-spacing: 0.5pt; }
+  .school-meta { font-size: 8pt; color: #4b5563; }
+  .motto { font-size: 8.5pt; color: #6b7280; margin-top: 1pt; }
+  .title { font-size: 12pt; font-weight: bold; color: #0f766e; letter-spacing: 1.5pt; margin-top: 5pt; }
+  .session { font-size: 8.5pt; color: #4b5563; }
+
+  /* Student */
+  .student { width: 100%; border-collapse: collapse; margin: 4pt 0 6pt 0; }
+  .student td { padding: 2pt 4pt; vertical-align: top; }
+  .label { color: #6b7280; font-size: 8pt; width: 22mm; }
+  .value { font-weight: bold; }
+  .photo-cell { width: 24mm; text-align: right; }
+  .photo { width: 22mm; height: 27mm; border: 0.6pt solid #cbd5e1; }
+
+  .section-title { font-size: 8pt; font-weight: bold; color: #1e3a5f; letter-spacing: 1pt; margin: 6pt 0 2pt 0; }
+  table.extras .section-title { margin-top: 0; }
+
+  /* Academic table */
+  table.marks { width: 100%; border-collapse: collapse; -fs-table-paginate: paginate; }
+  table.marks th { text-align: center; background-color: #eef2f7; color: #1e3a5f; font-size: 8pt; font-weight: bold; border: 0.6pt solid #94a3b8; padding: 3pt 3pt; }
+  table.marks td { border: 0.6pt solid #cbd5e1; padding: 3.5pt 3pt; font-size: 9.5pt; text-align: center; }
+  table.marks td.subject { text-align: left; font-weight: bold; }
+  table.marks th.subject { text-align: left; }
+  table.marks tr { page-break-inside: avoid; }
+  table.marks tr.totals td { background-color: #f1f5f9; font-weight: bold; border-top: 1pt solid #64748b; }
+  .muted { color: #9ca3af; }
+  .pending { color: #b45309; font-size: 8pt; }
+  .weight { font-weight: normal; color: #6b7280; font-size: 7pt; }
+  .compact table.marks td { padding: 2.2pt 2pt; font-size: 9pt; }
+  .compact table.marks th { padding: 2pt 2pt; font-size: 7.5pt; }
+
+  /* Summary */
+  table.summary { width: 100%; border-collapse: collapse; margin-top: 6pt; page-break-inside: avoid; }
+  table.summary td { width: 25%; text-align: center; border: 0.6pt solid #cbd5e1; padding: 4pt 2pt; }
+  .kpi { font-size: 13pt; font-weight: bold; color: #1e3a5f; }
+  .kpi-label { font-size: 7.5pt; color: #6b7280; text-transform: uppercase; letter-spacing: 0.6pt; }
+  .result-pass { color: #15803d; }
+  .result-fail { color: #b91c1c; }
+  .result-incomplete { color: #b45309; }
+  .note { font-size: 7.5pt; color: #6b7280; margin-top: 2pt; }
+
+  /* Attendance + co-scholastic */
+  table.extras { width: 100%; border-collapse: collapse; margin-top: 6pt; page-break-inside: avoid; }
+  td.extra { width: 50%; vertical-align: top; padding: 0; }
+  td.gap { width: 4mm; }
+  table.kv { width: 100%; border-collapse: collapse; }
+  table.kv td { border-bottom: 0.5pt solid #e5e7eb; padding: 2.5pt 3pt; }
+  table.kv td.right { text-align: right; font-weight: bold; }
+
+  /* Remarks */
+  .remarks { margin-top: 6pt; page-break-inside: avoid; }
+  .remark { border: 0.6pt solid #e5e7eb; padding: 4pt 5pt; margin-bottom: 3pt; min-height: 9mm; }
+  .remark-label { font-size: 7.5pt; font-weight: bold; color: #6b7280; letter-spacing: 0.6pt; }
+
+  /* Signatures + footer: a running element shown in the bottom margin of the final page. */
+  #signatures { position: running(signatures); width: 100%; }
+  table.sign { width: 100%; border-collapse: collapse; margin-top: 12mm; }
+  table.sign td { width: 33%; text-align: center; vertical-align: bottom; font-size: 8pt; color: #374151; }
+  .sign-line { border-top: 0.7pt solid #374151; margin: 0 8mm; padding-top: 2pt; }
+  .footer { font-size: 7pt; color: #6b7280; text-align: center; margin-top: 3mm; }
+  .preview { font-size: 7pt; color: #b45309; text-align: center; }
+
+  /* Watermarks stay faint and centred behind the page. The logo is pre-faded by the renderer
+     (≈6% alpha, transparent background) because the PDF engine does not apply CSS opacity. */
+  .watermark { position: fixed; top: 128mm; left: 0; width: 100%; text-align: center; font-size: 40pt; color: #f3f4f6; font-weight: bold; letter-spacing: 4pt; z-index: -1; }
+  .watermark-logo { position: fixed; top: 108mm; left: 64mm; width: 60mm; z-index: -1; }
+  .verify { text-align: center; font-size: 6.5pt; color: #6b7280; }
+  .verify img { width: 17mm; height: 17mm; }
+</style>
+</head>
+<body th:class="${vm.density() + (vm.splitPages() ? ' split' : '')}">
+
+<div class="watermark" th:if="${vm.watermarkText() != null}" th:text="${vm.watermarkText()}">WATERMARK</div>
+<img class="watermark-logo" th:if="${watermarkLogo != null}" th:src="${watermarkLogo}" alt=""/>
+
+<div class="academic">
+  <!-- School header -->
+  <div class="header">
+    <img class="header-image" th:if="${headerImage != null}" th:src="${headerImage}" alt=""/>
+    <th:block th:if="${headerImage == null}">
+      <img class="logo" th:if="${logo != null}" th:src="${logo}" alt=""/>
+      <div class="school" th:text="${vm.school().name()}">School</div>
+      <div class="school-meta" th:if="${vm.school().addressLine() != null}" th:text="${vm.school().addressLine()}">Address</div>
+      <div class="school-meta" th:if="${vm.school().affiliationLine() != null}" th:text="${vm.school().affiliationLine()}">Affiliation</div>
+    </th:block>
+    <div class="motto" th:if="${vm.school().motto() != null}" th:text="${vm.school().motto()}">Motto</div>
+    <div class="title" th:text="${vm.title()}">REPORT CARD</div>
+    <div class="session" th:text="${'Academic Session ' + vm.sessionLabel()}">Academic Session</div>
+  </div>
+
+  <!-- Student information -->
+  <table class="student">
+    <tr>
+      <td class="label">Name</td><td class="value" th:text="${vm.student().name()}">Name</td>
+      <td class="label">Class</td><td class="value" th:text="${vm.student().sectionName() != null ? vm.student().className() + ' – ' + vm.student().sectionName() : vm.student().className()}">Class</td>
+      <td class="photo-cell" rowspan="3" th:if="${photo != null}"><img class="photo" th:src="${photo}" alt=""/></td>
+    </tr>
+    <tr>
+      <td class="label">Student ID</td><td class="value" th:text="${vm.student().studentId()}">ID</td>
+      <td class="label">Date of Birth</td><td class="value" th:text="${vm.student().dob() != null ? vm.student().dob() : '—'}">DOB</td>
+    </tr>
+    <tr>
+      <td class="label">Father</td><td class="value" th:text="${vm.student().fatherName() != null ? vm.student().fatherName() : '—'}">Father</td>
+      <td class="label">Mother</td><td class="value" th:text="${vm.student().motherName() != null ? vm.student().motherName() : '—'}">Mother</td>
+    </tr>
+  </table>
+
+  <!-- Academic table -->
+  <div class="section-title">ACADEMIC PERFORMANCE</div>
+  <table class="marks">
+    <thead>
+      <tr th:if="${vm.hasTerms()}">
+        <th class="subject" rowspan="2" style="width: 28%;">Subject</th>
+        <th th:each="t : ${vm.termHeaders()}" th:attr="colspan=${t.span()}">
+          <span th:text="${t.name()}">Term</span><span class="weight" th:if="${t.weightLabel() != null}" th:text="${' (' + t.weightLabel() + ')'}"></span>
+        </th>
+        <th rowspan="2">Total</th><th rowspan="2">%</th><th rowspan="2">Grade</th>
+      </tr>
+      <tr th:if="${vm.hasTerms()}">
+        <th th:each="c : ${vm.columns()}"><span th:text="${c.examName()}">Exam</span><span class="weight" th:if="${c.weightLabel() != null}" th:text="${' (' + c.weightLabel() + ')'}"></span></th>
+      </tr>
+      <tr th:unless="${vm.hasTerms()}">
+        <th class="subject" style="width: 28%;">Subject</th>
+        <th th:each="c : ${vm.columns()}"><span th:text="${c.examName()}">Exam</span><span class="weight" th:if="${c.weightLabel() != null}" th:text="${' (' + c.weightLabel() + ')'}"></span></th>
+        <th>Total</th><th>%</th><th>Grade</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr th:each="r : ${vm.rows()}">
+        <td class="subject" th:text="${r.subject()}">Subject</td>
+        <td th:each="cell : ${r.cells()}" th:text="${cell.text()}" th:class="${cell.css()}">72 / 100</td>
+        <td th:text="${r.total()}" th:classappend="${r.total() == 'Not entered' ? 'pending' : ''}">Total</td>
+        <td th:text="${r.percentage()}">%</td>
+        <td th:text="${r.grade()}">A1</td>
+      </tr>
+      <tr class="totals">
+        <td class="subject">Total</td>
+        <td th:each="cell : ${vm.totals().cells()}" th:text="${cell}">Total</td>
+        <td th:text="${vm.totals().total()}">Total</td>
+        <td th:text="${vm.totals().percentage()}">%</td>
+        <td th:text="${vm.totals().grade()}">Grade</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- Summary -->
+  <table class="summary">
+    <tr>
+      <td><div class="kpi" th:text="${vm.summary().percentage()}">82.5%</div><div class="kpi-label">Percentage</div></td>
+      <td><div class="kpi" th:text="${vm.summary().grade()}">A2</div><div class="kpi-label">Grade</div></td>
+      <td th:if="${vm.flags().rank()}"><div class="kpi" th:text="${vm.summary().rank()}">1</div><div class="kpi-label">Rank in section</div></td>
+      <td><div class="kpi" th:text="${vm.summary().result()}"
+               th:classappend="${vm.summary().result() == 'Pass' ? 'result-pass' : (vm.summary().result() == 'Fail' ? 'result-fail' : 'result-incomplete')}">Pass</div>
+          <div class="kpi-label">Result</div></td>
+    </tr>
+  </table>
+  <div class="note" th:if="${vm.summary().resultNote() != null}" th:text="${vm.summary().resultNote()}">Note</div>
+  <div class="note" th:if="${vm.summary().basis() != null}" th:text="${vm.summary().basis()}">Basis</div>
+</div>
+
+<div th:class="${vm.splitPages() ? 'page-break' : ''}">
+  <!-- Attendance + co-scholastic -->
+  <table class="extras" th:if="${vm.attendance() != null or vm.coScholastic() != null}">
+    <tr>
+      <td class="extra" th:if="${vm.attendance() != null}">
+        <div class="section-title">ATTENDANCE</div>
+        <table class="kv">
+          <tr><td>Working days</td><td class="right" th:text="${vm.attendance().workingDays()}">200</td></tr>
+          <tr><td>Days present</td><td class="right" th:text="${vm.attendance().present()}">190</td></tr>
+          <tr><td>Attendance</td><td class="right" th:text="${vm.attendance().percentage()}">95%</td></tr>
+        </table>
+      </td>
+      <td class="gap" th:if="${vm.attendance() != null and vm.coScholastic() != null}"></td>
+      <td class="extra" th:if="${vm.coScholastic() != null}">
+        <div class="section-title">CO-SCHOLASTIC</div>
+        <table class="kv">
+          <tr th:each="c : ${vm.coScholastic()}"><td th:text="${c.activity()}">Art</td><td class="right" th:text="${c.grade()}">A</td></tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+
+  <!-- Remarks -->
+  <div class="remarks" th:if="${vm.flags().teacherRemark() or vm.flags().principalRemark()}">
+    <div class="remark" th:if="${vm.flags().teacherRemark()}">
+      <div class="remark-label" th:text="${#strings.toUpperCase(vm.teacherSignatureLabel()) + '’S REMARKS'}">CLASS TEACHER'S REMARKS</div>
+      <div th:text="${vm.teacherRemark() != null ? vm.teacherRemark() : ' '}">Remark</div>
+    </div>
+    <div class="remark" th:if="${vm.flags().principalRemark()}">
+      <div class="remark-label" th:text="${#strings.toUpperCase(vm.principalSignatureLabel()) + '’S REMARKS'}">PRINCIPAL'S REMARKS</div>
+      <div th:text="${vm.principalRemark() != null ? vm.principalRemark() : ' '}">Remark</div>
+    </div>
+  </div>
+</div>
+
+<!-- Signatures & footer (running element: printed at the bottom of the final page) -->
+<div id="signatures">
+  <table class="sign">
+    <tr>
+      <td><div class="sign-line" th:text="${vm.teacherSignatureLabel()}">Class Teacher</div></td>
+      <td>
+        <div class="verify" th:if="${vm.hasVerification()}">
+          <img th:src="${vm.verificationQr()}" alt=""/>
+          <div th:text="${'Verify this report card · Ref ' + vm.verificationRef()}">Verify</div>
+        </div>
+      </td>
+      <td><div class="sign-line" th:text="${vm.principalSignatureLabel()}">Principal</div></td>
+    </tr>
+  </table>
+  <div class="footer" th:if="${vm.footerText() != null}" th:text="${vm.footerText()}">Footer</div>
+  <div class="preview" th:if="${vm.previewLine() != null}" th:text="${vm.previewLine()}">Preview</div>
+  <div class="footer" th:if="${vm.issuedLine() != null}" th:text="${vm.issuedLine()}">Issued</div>
+</div>
+
+</body>
+</html>

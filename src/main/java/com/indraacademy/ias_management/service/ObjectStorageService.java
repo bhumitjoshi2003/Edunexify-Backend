@@ -134,6 +134,31 @@ public class ObjectStorageService {
         }
     }
 
+    /** Server-side upload of generated content (e.g. a published report-card PDF). */
+    public void putObject(String objectKey, byte[] content, String contentType) {
+        S3Client client = requireClient();
+        client.putObject(PutObjectRequest.builder()
+                        .bucket(properties.getBucket())
+                        .key(objectKey)
+                        .contentType(contentType)
+                        .contentLength((long) content.length)
+                        .build(),
+                software.amazon.awssdk.core.sync.RequestBody.fromBytes(content));
+    }
+
+    /** Server-side download of a stored object's bytes; empty when it does not exist. */
+    public Optional<byte[]> getObjectBytes(String objectKey) {
+        S3Client client = requireClient();
+        try {
+            return Optional.of(client.getObjectAsBytes(GetObjectRequest.builder()
+                    .bucket(properties.getBucket())
+                    .key(objectKey)
+                    .build()).asByteArray());
+        } catch (NoSuchKeyException e) {
+            return Optional.empty();
+        }
+    }
+
     /** Idempotent and tolerant of an already-missing object — deletion cleanup (old-photo
      * replacement, orphan sweep) must never turn "it's already gone" into a fatal error. */
     public void deleteObjectQuietly(String objectKey) {

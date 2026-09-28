@@ -156,7 +156,33 @@ public class ReportCardPdfGenerator {
 
     // ── Public API ────────────────────────────────────────────────────────
 
+    // ── Report Card V2 renderer (the one visual standard) ─────────────────
+    // Present in the running application: every Phase 0 PDF (single, bulk, email) is drawn by the
+    // V2 renderer from the same data, so all report cards share one design. Absent in unit tests
+    // that construct this class directly, which then exercise the legacy OpenPDF layout below.
+    @org.springframework.beans.factory.annotation.Autowired(required = false) private ReportCardRenderer v2Renderer;
+    @org.springframework.beans.factory.annotation.Autowired(required = false) private ReportCardDesignService designService;
+    @org.springframework.beans.factory.annotation.Autowired(required = false) private com.indraacademy.ias_management.util.SecurityUtil securityUtil;
+
+    /** The report-card PDF: the V2 design when available, otherwise the legacy OpenPDF layout. */
     public byte[] generate(ReportCardDataDTO data) {
+        if (v2Renderer != null && designService != null && securityUtil != null && securityUtil.getSchoolId() != null) {
+            return v2Renderer.render(ReportCardV2Documents.fromPhase0(data,
+                    designService.designFor(securityUtil.getSchoolId()), qrDataUri(data.getVerificationToken()),
+                    verificationReference(data.getVerificationToken())));
+        }
+        return generateLegacy(data);
+    }
+
+    /** The verification QR as a data URI (same URL/token as the legacy layout); null without a token. */
+    String qrDataUri(String token) {
+        if (token == null || token.isBlank()) return null;
+        byte[] png = generateQrBytes(verificationUrl(token), 240);
+        return png == null ? null : "data:image/png;base64," + java.util.Base64.getEncoder().encodeToString(png);
+    }
+
+    /** Legacy OpenPDF layout (kept until Phase 0 is retired). */
+    public byte[] generateLegacy(ReportCardDataDTO data) {
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
         // A4, compact margins. Static school/student identity keeps its size;
         // variable sections below use compact spacing so ordinary reports stay on one page.
@@ -1650,13 +1676,18 @@ public class ReportCardPdfGenerator {
      * falls back to the production site so a printed QR is never a dead link.
      */
     String verificationUrl(String token) {
+        return frontendBase() + "/verify-rc?token="
+                + java.net.URLEncoder.encode(token, java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    /** The web app's base URL (no trailing slash), with the same safe fallback as the QR link. */
+    String frontendBase() {
         String base = frontendUrl != null ? frontendUrl.trim() : "";
         if (!base.startsWith("https://") && !base.startsWith("http://")) {
-            log.warn("frontend.url is not a usable URL ({}); report-card QR codes use {}", base, DEFAULT_FRONTEND_URL);
+            log.warn("frontend.url is not a usable URL ({}); report-card links use {}", base, DEFAULT_FRONTEND_URL);
             base = DEFAULT_FRONTEND_URL;
         }
-        return base.replaceAll("/+$", "") + "/verify-rc?token="
-                + java.net.URLEncoder.encode(token, java.nio.charset.StandardCharsets.UTF_8);
+        return base.replaceAll("/+$", "");
     }
 
     /**

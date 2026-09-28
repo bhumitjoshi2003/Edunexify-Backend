@@ -48,6 +48,7 @@ public class ReportCardPublicationService {
     @Autowired private StudentEnrollmentRepository                                 studentEnrollmentRepository;
     @Autowired private com.indraacademy.ias_management.repository.ReportCardTemplateRepository templateRepository;
     @Autowired private com.indraacademy.ias_management.repository.AssessmentGroupExamMappingRepository examMappingRepository;
+    @Autowired private org.springframework.beans.factory.ObjectProvider<ReportCardV2PublicationService> v2Publications;
     @Autowired private com.indraacademy.ias_management.repository.AssessmentGroupCompositionRepository compositionRepository;
     @Autowired private com.indraacademy.ias_management.repository.ExamConfigRepository examConfigRepository;
 
@@ -221,6 +222,12 @@ public class ReportCardPublicationService {
     public VerifyRcDTO verifyByToken(String token) {
         if (token == null || token.isBlank()) {
             return VerifyRcDTO.invalid("Invalid verification link.");
+        }
+        // Report Card V2 documents first (their own tokens); anything else is a Phase 0 token.
+        ReportCardV2PublicationService v2Service = v2Publications != null ? v2Publications.getIfAvailable() : null;
+        if (v2Service != null) {
+            java.util.Optional<VerifyRcDTO> v2 = v2Service.verify(token);
+            if (v2.isPresent()) return v2.get();
         }
         return pubRepo.findByVerificationToken(token)
             // A card whose results were unpublished after it was issued is no longer valid: answer

@@ -38,6 +38,8 @@ public class ExamConfigService {
     @Autowired private ClassSubjectRepository classSubjectRepository;
     @Autowired private SecurityUtil securityUtil;
     @Autowired private AssessmentGroupExamMappingRepository assessmentGroupExamMappingRepository;
+    @Autowired(required = false) private com.indraacademy.ias_management.repository.ReportCardSetupExamRepository reportCardSetupExamRepository;
+    @Autowired(required = false) private com.indraacademy.ias_management.repository.ReportCardPublicationV2Repository reportCardPublicationV2Repository;
     @Autowired private AuditService auditService;
     @Autowired private com.indraacademy.ias_management.repository.AcademicSessionRepository academicSessionRepository;
     @Autowired private com.indraacademy.ias_management.repository.SchoolClassRepository schoolClassRepository;
@@ -115,6 +117,10 @@ public class ExamConfigService {
             throw new IllegalStateException("'" + exam.getExamName()
                     + "' is used by a report-card assessment group. Remove it from the group first.");
         }
+        if (reportCardSetupExamRepository != null && reportCardSetupExamRepository.existsByExamConfigIdAndSchoolId(id, schoolId)) {
+            throw new IllegalStateException("'" + exam.getExamName()
+                    + "' is used by a report card (Report Cards → Setup). Remove it from the report card first.");
+        }
         examSubjectEntryRepository.deleteByExamConfigIdAndSchoolId(id, schoolId);
         examConfigRepository.delete(exam);
         log.info("Deleted ExamConfig id={} (no marks)", id);
@@ -148,6 +154,10 @@ public class ExamConfigService {
         Long schoolId = securityUtil.getSchoolId();
         ExamConfig exam = ownedExam(id, schoolId);
         if (!exam.isPublished()) return exam;
+        // A frozen (V2) report card that includes this exam is still official: unpublish it first.
+        if (reportCardPublicationV2Repository != null && reportCardPublicationV2Repository.existsActiveForExam(id, schoolId)) {
+            throw new IllegalStateException("This exam is part of a published report card. Unpublish the report card first.");
+        }
         exam.setResultStatus(ExamResultStatus.DRAFT);
         exam.setPublishedAt(null);
         exam.setPublishedBy(null);

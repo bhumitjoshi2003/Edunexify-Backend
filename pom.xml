@@ -87,6 +87,25 @@
 			<version>9.1.22</version>
 		</dependency>
 
+		<!-- Report Card V2 renderer: HTML template -> PDF (PDFBox 3; shapes Devanagari via fontbox GSUB) -->
+		<dependency>
+			<groupId>io.github.openhtmltopdf</groupId>
+			<artifactId>openhtmltopdf-pdfbox</artifactId>
+			<version>1.1.87</version>
+			<exclusions>
+				<!-- spring-jcl already provides the commons-logging API -->
+				<exclusion>
+					<groupId>commons-logging</groupId>
+					<artifactId>commons-logging</artifactId>
+				</exclusion>
+			</exclusions>
+		</dependency>
+		<!-- Report Card V2 HTML template (standalone engine; no Spring MVC view resolution) -->
+		<dependency>
+			<groupId>org.thymeleaf</groupId>
+			<artifactId>thymeleaf</artifactId>
+		</dependency>
+
 		<!-- QR code generation for report card verification -->
 		<dependency>
 			<groupId>com.google.zxing</groupId>
