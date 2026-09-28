@@ -134,12 +134,14 @@ public class ReportCardPublicationService {
 
         List<Student> recipients = historicalRecipientRoster(schoolId, className, session);
         String publicationKey = pub.getPublishedAt().format(DateTimeFormatter.ISO_LOCAL_DATE_TIME);
+        Long classId = schoolClassRepository.findBySchoolIdAndName(schoolId, className).map(SchoolClass::getId).orElse(null);
         for (Student student : recipients) {
             businessNotifications.studentAndParents(schoolId, student.getStudentId(),
                     NotificationAudienceType.STUDENT_WITH_RESULT_PARENTS,
                     NotificationEventCode.REPORT_CARD_READY, NotificationCategory.ACADEMICS_RESULTS,
                     "Report Card Available", "Your report card for " + session + " is now available.",
-                    "ReportCardPublication", String.valueOf(pub.getId()), "/dashboard/report-card", username,
+                    "ReportCardPublication", String.valueOf(pub.getId()),
+                    reportCardRoute(student.getStudentId(), templateId, session, classId), username,
                     "report-card:" + pub.getId() + ":" + publicationKey + ":" + student.getStudentId(),
                     Set.of(ExternalDeliveryChannel.PUSH));
         }
@@ -179,14 +181,24 @@ public class ReportCardPublicationService {
             .filter(s -> s.getEmail() != null && !s.getEmail().isBlank())
             .count();
 
-        String schoolName = "";
-        try {
-            ReportCardTemplateDTO t = templateService.getTemplate(templateId);
-            schoolName = t.getName();
-        } catch (Exception ignored) {}
+        String schoolName = schoolRepository.findById(schoolId).map(s -> s.getName()).orElse("");
 
         blastService.execute(templateId, session, className, schoolId, students, schoolName);
         return withEmail;
+    }
+
+    /**
+     * The notification's link to this student's published card. It names only the recipient's
+     * own student (the notification goes to that student and their parents); opening it still
+     * passes the normal report-card access check, so it can never show another student's card.
+     */
+    static String reportCardRoute(String studentId, Long templateId, String session, Long classId) {
+        StringBuilder route = new StringBuilder("/dashboard/report-card?studentId=")
+                .append(java.net.URLEncoder.encode(studentId, java.nio.charset.StandardCharsets.UTF_8))
+                .append("&session=").append(java.net.URLEncoder.encode(session, java.nio.charset.StandardCharsets.UTF_8))
+                .append("&templateId=").append(templateId);
+        if (classId != null) route.append("&classId=").append(classId);
+        return route.toString();
     }
 
     // ── QR Verification ───────────────────────────────────────────────────

@@ -60,6 +60,11 @@ public class ReportCardDataDTO {
     private Double cgpa;
     /** UUID token for QR-based public verification. Null if not yet published. */
     private String verificationToken;
+    /** Heading naming what the card covers: "HALF YEARLY — REPORT CARD" or "ANNUAL REPORT CARD". */
+    private String reportTitle;
+
+    public String getReportTitle() { return reportTitle; }
+    public void setReportTitle(String reportTitle) { this.reportTitle = reportTitle; }
 
     public ReportCardDataDTO() {}
 

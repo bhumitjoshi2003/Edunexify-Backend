@@ -243,7 +243,7 @@ class ReportCardControllerHistoricalTest {
                 .thenReturn(java.util.Optional.of("token-abc"));
         when(pdfGenerator.generate(dto)).thenReturn(new byte[]{1, 2, 3});
 
-        ResponseEntity<?> response = controller.downloadPdf(STUDENT_ID, TEMPLATE_ID, SESSION, null);
+        ResponseEntity<?> response = controller.downloadPdf(STUDENT_ID, TEMPLATE_ID, SESSION, null, null);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(dto.getVerificationToken()).isEqualTo("token-abc");

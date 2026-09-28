@@ -153,6 +153,12 @@ public class ReportCardController {
     @PutMapping("/report-cards/remarks")
     @PreAuthorize("hasAnyRole('" + Role.ADMIN + "', '" + Role.TEACHER + "')")
     public ResponseEntity<Void> saveRemarks(@Valid @RequestBody RemarksRequest req) {
+        // Principal remarks are ADMIN-only; a teacher may only write the class teacher's remark.
+        if (Role.TEACHER.equals(securityUtil.getRole()) && req.getStudentRemarks().stream()
+                .anyMatch(item -> item.getPrincipalRemark() != null)) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN,
+                    "Only an administrator can enter the principal's remarks.");
+        }
         checkTeacherOwnsStudents(req.getStudentRemarks().stream()
                 .map(RemarksRequest.StudentRemarkItem::getStudentId).toList());
         remarksService.saveRemarks(req);
@@ -184,16 +190,22 @@ public class ReportCardController {
     }
 
     /**
-     * Generate and download a single student's report card as PDF.
-     * GET /api/report-cards/pdf?studentId=&templateId=&session=
+     * Generate and download a single student's report card as PDF — the one document used for
+     * both "Preview & Print" and "Download" on Web and Android.
+     * GET /api/report-cards/pdf?studentId=&session=&templateId=   (template card)
+     * GET /api/report-cards/pdf?studentId=&session=[&examId=]     (results card: no template)
      */
     @GetMapping("/report-cards/pdf")
     @PreAuthorize("hasAnyRole('" + Role.ADMIN + "', '" + Role.TEACHER + "', '" + Role.STUDENT + "', '" + Role.PARENT + "')")
     public ResponseEntity<?> downloadPdf(
             @RequestParam String studentId,
-            @RequestParam Long templateId,
+            @RequestParam(required = false) Long templateId,
             @RequestParam String session,
-            @RequestParam(required = false) Long classId) {
+            @RequestParam(required = false) Long classId,
+            @RequestParam(required = false) Long examId) {
+        if (templateId == null) {
+            return downloadResultsPdf(studentId, session, examId, classId);
+        }
         try {
             checkStudentOrParentPublishedAccess(studentId, templateId, session, classId);
             checkTeacherOwnsStudents(List.of(studentId));
@@ -220,6 +232,35 @@ public class ReportCardController {
     }
 
     /**
+     * The report card built from the student's exam results (no template): what Class Results,
+     * My Results and the parent portal open. Students and parents get published exams only and
+     * only their own / their child's card; teachers only their own class; no verification QR
+     * (only a published template card has a verification token).
+     */
+    private ResponseEntity<?> downloadResultsPdf(String studentId, String session, Long examId, Long classId) {
+        checkStudentOrParentOwnAccess(studentId);
+        checkTeacherOwnsStudents(List.of(studentId));
+        String role = securityUtil.getRole();
+        boolean includeDrafts = Role.ADMIN.equals(role) || Role.TEACHER.equals(role);
+        ReportCardDataDTO data;
+        try {
+            data = assembler.assembleFromResults(studentId, session, examId, classId, includeDrafts);
+        } catch (ReportCardDataAssembler.ReportCardContextAmbiguousException e) {
+            return ambiguousResponse(studentId, e);
+        } catch (java.util.NoSuchElementException e) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, e.getMessage());
+        } catch (IllegalArgumentException e) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, e.getMessage());
+        }
+        byte[] pdf = pdfGenerator.generate(data);
+        String filename = sanitizeFilename(data.getStudentName()) + "_" + session + "_ReportCard.pdf";
+        return ResponseEntity.ok()
+                .contentType(MediaType.APPLICATION_PDF)
+                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + filename + "\"")
+                .body(pdf);
+    }
+
+    /**
      * Generate and download all students' report cards for a class as a ZIP of PDFs.
      * GET /api/report-cards/pdf/bulk?templateId=&session=&className=
      */
@@ -237,11 +278,18 @@ public class ReportCardController {
                 .map(com.indraacademy.ias_management.entity.SchoolClass::getId).orElse(null);
         List<Student> students = historicalClassRoster(schoolId, className, classId, sectionId, session);
 
+        // Computed once for the class (not per student); the verification token is per class.
+        Map<String, Integer> classRanks = assembler.classRanksForTemplate(templateId, session);
+        String verificationToken = publicationService.getVerificationToken(templateId, session, className).orElse(null);
+
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
         try (ZipOutputStream zip = new ZipOutputStream(baos)) {
             for (Student student : students) {
                 try {
-                    ReportCardDataDTO data = assembler.assemble(student.getStudentId(), templateId, session, classId);
+                    // Unchanged Phase 0 behaviour: a student whose card cannot be generated is
+                    // skipped (logged) and the ZIP still contains everyone else.
+                    ReportCardDataDTO data = assembler.assemble(student.getStudentId(), templateId, session, classId, classRanks);
+                    data.setVerificationToken(verificationToken);
                     byte[] pdf = pdfGenerator.generate(data);
                     String entryName = sanitizeFilename(student.getName()) + "_" + student.getStudentId() + ".pdf";
                     zip.putNextEntry(new ZipEntry(entryName));
@@ -394,6 +442,18 @@ public class ReportCardController {
      * expired/inactive parent relationship; it only supplies the class context once the caller is
      * already authorized.
      */
+    /** A student may only open their own card; a parent only a linked child with results access. */
+    private void checkStudentOrParentOwnAccess(String studentId) {
+        String role = securityUtil.getRole();
+        if (Role.STUDENT.equals(role) && !studentId.equals(securityUtil.getUsername())) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN,
+                    "Students can only access their own report card.");
+        }
+        if (Role.PARENT.equals(role)) {
+            parentPortalService.assertChildAccess(studentId, ParentPortalService.ChildPermission.RESULTS);
+        }
+    }
+
     private void checkStudentOrParentPublishedAccess(String studentId, Long templateId, String session, Long classId) {
         String role = securityUtil.getRole();
         if (!Role.STUDENT.equals(role) && !Role.PARENT.equals(role)) return;

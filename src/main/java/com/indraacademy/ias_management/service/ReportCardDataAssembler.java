@@ -17,8 +17,15 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
+import com.indraacademy.ias_management.dto.ExamResultDTO;
+import com.indraacademy.ias_management.dto.SubjectResultDTO;
+import com.indraacademy.ias_management.entity.ExamConfig;
+import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Optional;
 import java.util.Set;
@@ -53,6 +60,8 @@ public class ReportCardDataAssembler {
     @Autowired private SecurityUtil securityUtil;
     @Autowired private StudentTemporalMembershipResolver temporalMembershipResolver;
     @Autowired private SchoolClassRepository schoolClassRepo;
+    @Autowired private ExamConfigRepository examConfigRepo;
+    @Autowired private ExamSubjectEntryRepository subjectEntryRepo;
 
     private static final DateTimeFormatter DOB_FMT = DateTimeFormatter.ofPattern("dd MMM yyyy");
 
@@ -76,6 +85,25 @@ public class ReportCardDataAssembler {
      */
     @Transactional(readOnly = true)
     public ReportCardDataDTO assemble(String studentId, Long templateId, String session, Long classId) {
+        return assemble(studentId, templateId, session, classId, null);
+    }
+
+    /**
+     * Class ranks for a template's card (see WeightageCalculationEngine.classRanks), computed once
+     * so bulk PDFs and email blasts don't recompute the whole class for every student.
+     */
+    @Transactional(readOnly = true)
+    public Map<String, Integer> classRanksForTemplate(Long templateId, String session) {
+        Long schoolId = securityUtil.getSchoolId();
+        ReportCardTemplate template = templateRepo.findByIdAndSchoolId(templateId, schoolId)
+                .orElseThrow(() -> new NoSuchElementException("Template not found: " + templateId));
+        return weightageEngine.classRanks(template.getAssessmentGroupId(), session);
+    }
+
+    /** @param classRanks precomputed {@link #classRanksForTemplate}, or null to compute them here. */
+    @Transactional(readOnly = true)
+    public ReportCardDataDTO assemble(String studentId, Long templateId, String session, Long classId,
+                                      Map<String, Integer> classRanks) {
         Long schoolId = securityUtil.getSchoolId();
 
         // 1. Load student
@@ -93,6 +121,12 @@ public class ReportCardDataAssembler {
         // 4. Compute weighted result via engine
         WeightedGroupResultDTO weightedResult = weightageEngine
                 .computeForStudent(studentId, template.getAssessmentGroupId(), session);
+        // Rank: the canonical section-aware competition rank of the weighted percentage (unranked
+        // while any mark is missing) — the same ResultCalculator ranking as Class Results.
+        Map<String, Integer> ranks = classRanks != null ? classRanks
+                : weightageEngine.classRanks(template.getAssessmentGroupId(), session);
+        Integer rank = ranks != null ? ranks.get(studentId) : null;
+        weightedResult.setRank(rank != null ? rank : 0);
 
         // 4b. Resolve the class/section this report card's academic context actually belongs to
         // for this session — never student.getClassName() directly. See resolveHistoricalContext.
@@ -107,44 +141,11 @@ public class ReportCardDataAssembler {
         // Assemble DTO
         ReportCardDataDTO dto = new ReportCardDataDTO();
 
-        // Student fields
-        dto.setStudentId(student.getStudentId());
-        dto.setStudentName(student.getName());
-        dto.setClassName(resolvedClassName);
-        // E6E: historical section now comes from the applicable realized StudentEnrollment
-        // segment for this class/session (E6B) rather than a guess — see resolveHistoricalSection.
-        // When no enrollment segment applies, falls back to the student's live section only when
-        // the resolved class still equals their CURRENT class (no promotion since this session —
-        // a genuinely safe, wholly-legacy case), and is left unset otherwise rather than guessed.
-        dto.setSectionName(context.sectionName());
-        dto.setSession(session);
-        dto.setFatherName(student.getFatherName());
-        dto.setMotherName(student.getMotherName());
-        if (student.getDob() != null) {
-            dto.setDateOfBirth(student.getDob().format(DOB_FMT));
-        }
-        // Fresh presigned GET URLs for any object-storage key (legacy local-disk paths and
-        // already-absolute URLs pass through unchanged) — ReportCardPdfGenerator's
-        // loadStudentPhotoImage/loadLogoImage/loadHeaderImage already fetch any http(s) URL over
-        // the network, so no generator changes are needed for this to work.
-        dto.setPhotoUrl(objectStorageService.resolveDisplayUrl(student.getPhotoUrl()));
-
-        // School fields
-        dto.setSchoolName(school.getName());
-        dto.setSchoolLogoUrl(objectStorageService.resolveDisplayUrl(school.getLogoUrl()));
-        dto.setSchoolAddress(school.getAddress());
-        dto.setSchoolPhone(school.getPhone());
-        dto.setSchoolEmail(school.getEmail());
-        if (school.getBoardType() != null) {
-            dto.setBoardType(school.getBoardType().name());
-        }
-        dto.setAffiliationNumber(school.getAffiliationNumber());
-        dto.setSchoolCode(school.getSchoolCode());
-        dto.setSchoolCity(school.getCity());
-        dto.setReportCardHeaderImageUrl(objectStorageService.resolveDisplayUrl(school.getReportCardHeaderImageUrl()));
+        fillStudentAndSchool(dto, student, school, context, session);
 
         // Template
         dto.setTemplate(templateService.getTemplate(templateId));
+        dto.setReportTitle(reportTitle(templateTerm(dto.getTemplate(), weightedResult), false));
         dto.setGradingSystem(gradingSystem);
 
         // Weighted result
@@ -200,6 +201,215 @@ public class ReportCardDataAssembler {
         }
 
         return dto;
+    }
+
+
+    /** Student, historical class/section and school fields shared by both kinds of card. */
+    private void fillStudentAndSchool(ReportCardDataDTO dto, Student student, School school,
+                                      HistoricalReportCardContext context, String session) {
+        String resolvedClassName = context.className();
+        // Student fields
+        dto.setStudentId(student.getStudentId());
+        dto.setStudentName(student.getName());
+        dto.setClassName(resolvedClassName);
+        // E6E: historical section now comes from the applicable realized StudentEnrollment
+        // segment for this class/session (E6B) rather than a guess — see resolveHistoricalSection.
+        // When no enrollment segment applies, falls back to the student's live section only when
+        // the resolved class still equals their CURRENT class (no promotion since this session —
+        // a genuinely safe, wholly-legacy case), and is left unset otherwise rather than guessed.
+        dto.setSectionName(context.sectionName());
+        dto.setSession(session);
+        dto.setFatherName(student.getFatherName());
+        dto.setMotherName(student.getMotherName());
+        if (student.getDob() != null) {
+            dto.setDateOfBirth(student.getDob().format(DOB_FMT));
+        }
+        // Fresh presigned GET URLs for any object-storage key (legacy local-disk paths and
+        // already-absolute URLs pass through unchanged) — ReportCardPdfGenerator's
+        // loadStudentPhotoImage/loadLogoImage/loadHeaderImage already fetch any http(s) URL over
+        // the network, so no generator changes are needed for this to work.
+        dto.setPhotoUrl(objectStorageService.resolveDisplayUrl(student.getPhotoUrl()));
+
+        // School fields
+        dto.setSchoolName(school.getName());
+        dto.setSchoolLogoUrl(objectStorageService.resolveDisplayUrl(school.getLogoUrl()));
+        dto.setSchoolAddress(school.getAddress());
+        dto.setSchoolPhone(school.getPhone());
+        dto.setSchoolEmail(school.getEmail());
+        if (school.getBoardType() != null) {
+            dto.setBoardType(school.getBoardType().name());
+        }
+        dto.setAffiliationNumber(school.getAffiliationNumber());
+        dto.setSchoolCode(school.getSchoolCode());
+        dto.setSchoolCity(school.getCity());
+        dto.setReportCardHeaderImageUrl(objectStorageService.resolveDisplayUrl(school.getReportCardHeaderImageUrl()));
+    }
+
+    // ── Report title ──────────────────────────────────────────────────────
+
+    /**
+     * The card's heading, shared by the PDF and the on-screen card: the exam (or term) it covers —
+     * "HALF YEARLY — REPORT CARD" — or "ANNUAL REPORT CARD" for the whole session. A single-exam
+     * card is never labelled Annual.
+     */
+    static String reportTitle(String term, boolean wholeSession) {
+        if (wholeSession) return "ANNUAL REPORT CARD";
+        if (term == null || term.isBlank()) return "REPORT CARD";
+        String t = term.trim().replaceAll("\\s+", " ").toUpperCase();
+        return t.contains("ANNUAL") ? "ANNUAL REPORT CARD" : t + " \u2014 REPORT CARD";
+    }
+
+    /** A template card covers its branding's exam term if set, otherwise its assessment group. */
+    private static String templateTerm(ReportCardTemplateDTO template, WeightedGroupResultDTO result) {
+        if (template != null && template.getBrandingJson() != null && !template.getBrandingJson().isBlank()) {
+            try {
+                Object term = new com.fasterxml.jackson.databind.ObjectMapper()
+                        .readValue(template.getBrandingJson(), Map.class).get("examTerm");
+                if (term instanceof String s && !s.isBlank()) return s;
+            } catch (Exception ignored) { /* malformed branding: fall back to the group name */ }
+        }
+        return result != null ? result.getGroupName() : null;
+    }
+
+    // ── Results-based card (no template) ──────────────────────────────────
+
+    /**
+     * Report card built straight from the canonical Results Phase 1 data (the exam results My
+     * Results and Class Results show) when no template is used — the card Class Results, My
+     * Results and the parent portal open. One exam, or every exam of the session as columns.
+     * Rendered by the same ReportCardPdfGenerator as template cards.
+     *
+     * @param includeDrafts staff see draft exams (as on their results screens); students and
+     *                      parents only ever get published results.
+     */
+    @Transactional(readOnly = true)
+    public ReportCardDataDTO assembleFromResults(String studentId, String session, Long examId, Long classId,
+                                                 boolean includeDrafts) {
+        Long schoolId = securityUtil.getSchoolId();
+        Student student = studentRepo.findByStudentIdAndSchoolId(studentId, schoolId)
+                .orElseThrow(() -> new NoSuchElementException("Student not found: " + studentId));
+        School school = schoolRepo.findById(schoolId)
+                .orElseThrow(() -> new NoSuchElementException("School not found: " + schoolId));
+
+        List<ExamResultDTO> results = new ArrayList<>(markService.getStudentResults(studentId, session, includeDrafts));
+        if (examId != null) results.removeIf(r -> !examId.equals(r.getExamId()));
+        if (results.isEmpty()) {
+            throw new NoSuchElementException("No results are available for this report card yet.");
+        }
+        HistoricalReportCardContext context = resolveHistoricalContext(studentId, session, classId, student);
+
+        String rawGrading = markService.gradingSystem(schoolId);
+        String gradingSystem = GradingPolicy.system(rawGrading);
+        ReportCardDataDTO dto = new ReportCardDataDTO();
+        fillStudentAndSchool(dto, student, school, context, session);
+        dto.setGradingSystem(gradingSystem);
+        dto.setWeightedResult(resultsTable(results, rawGrading, examId != null));
+        dto.setReportTitle(reportTitle(examId != null ? results.get(0).getExamName() : null, examId == null));
+        try {
+            dto.setAttendance(buildAttendanceBlock(studentId, session, schoolId));
+        } catch (RuntimeException e) {
+            log.warn("Report card attendance unavailable for student {} session {}: {}", studentId, session, e.getMessage());
+        }
+
+        // A results-based card is not a report-card publication: it has no verification token and
+        // therefore no QR (only a published template card is verifiable — see ReportCardPdfGenerator).
+        dto.setVerificationToken(null);
+
+        WeightedGroupResultDTO table = dto.getWeightedResult();
+        dto.setOverallGrade(GradingPolicy.grade(table.getWeightedPercentage(), rawGrading));
+        if (results.size() == 1) {
+            // One exam: exactly the rank My Results / Class Results show for it.
+            Integer rank = results.get(0).getOverallRank();
+            table.setRank(rank != null ? rank : 0);
+        } else {
+            Integer rank = aggregateRanks(results).get(studentId);
+            table.setRank(rank != null ? rank : 0);
+        }
+        if ("CBSE".equals(gradingSystem) && table.getMarksMissing() == 0) {
+            dto.setCgpa(computeCgpa(table, gradingSystem));
+        }
+        return dto;
+    }
+
+    /** The results as a marks table: one column per exam, one row per subject. */
+    private WeightedGroupResultDTO resultsTable(List<ExamResultDTO> results, String rawGrading, boolean singleExam) {
+        List<WeightedGroupResultDTO.MarksTableDTO.ExamColumnDTO> columns = new ArrayList<>();
+        List<WeightedGroupResultDTO.MarksTableDTO.ExamTotalDTO> totals = new ArrayList<>();
+        Map<String, WeightedGroupResultDTO.MarksTableDTO.SubjectExamMarkDTO[]> cells = new LinkedHashMap<>();
+        Map<String, double[]> subjectTotals = new HashMap<>();     // [obtained, max, missing]
+        Map<String, String> singleExamGrades = new HashMap<>();
+        double obtained = 0, max = 0;
+        int missing = 0;
+        for (int i = 0; i < results.size(); i++) {
+            ExamResultDTO r = results.get(i);
+            columns.add(new WeightedGroupResultDTO.MarksTableDTO.ExamColumnDTO(r.getExamId(), r.getExamName(),
+                    r.getTotalMaxMarks(), 1.0 / results.size()));
+            totals.add(new WeightedGroupResultDTO.MarksTableDTO.ExamTotalDTO(r.getTotalMarksObtained(), r.getTotalMaxMarks()));
+            obtained += r.getTotalMarksObtained();
+            max += r.getTotalMaxMarks();
+            missing += r.getMarksMissing();
+            for (SubjectResultDTO sub : r.getSubjects()) {
+                int maxMarks = sub.getMaxMarks() != null ? sub.getMaxMarks() : 0;
+                Double got = sub.getMarksObtained();
+                double pct = maxMarks > 0 && got != null ? got / maxMarks * 100.0 : 0.0;
+                cells.computeIfAbsent(sub.getSubjectName(),
+                        k -> new WeightedGroupResultDTO.MarksTableDTO.SubjectExamMarkDTO[results.size()])[i] =
+                        new WeightedGroupResultDTO.MarksTableDTO.SubjectExamMarkDTO(got, maxMarks, pct);
+                double[] t = subjectTotals.computeIfAbsent(sub.getSubjectName(), k -> new double[3]);
+                t[0] += got != null ? got : 0;
+                t[1] += maxMarks;
+                if (got == null) t[2]++;
+                if (singleExam) singleExamGrades.put(sub.getSubjectName(), sub.getGrade());
+            }
+        }
+        List<WeightedGroupResultDTO.MarksTableDTO.SubjectRowDTO> rows = new ArrayList<>();
+        List<WeightedGroupResultDTO.SubjectWeightedResultDTO> subjects = new ArrayList<>();
+        for (var entry : cells.entrySet()) {
+            double[] t = subjectTotals.get(entry.getKey());
+            double pct = t[1] > 0 ? t[0] / t[1] * 100.0 : 0.0;
+            var row = new WeightedGroupResultDTO.MarksTableDTO.SubjectRowDTO(entry.getKey(),
+                    new ArrayList<>(java.util.Arrays.asList(entry.getValue())), pct);   // null = subject not in that exam
+            // A subject with a mark not entered has no grade (canonical rule), never a silent zero grade.
+            row.setGrade(singleExam ? singleExamGrades.get(entry.getKey())
+                    : t[2] > 0 ? null : GradingPolicy.grade(pct, rawGrading));
+            rows.add(row);
+            subjects.add(new WeightedGroupResultDTO.SubjectWeightedResultDTO(entry.getKey(), pct));
+        }
+        double percentage = max > 0 ? obtained / max * 100.0 : 0.0;   // missing marks count as absent ("Ab")
+        String name = singleExam ? results.get(0).getExamName() : "All Examinations";
+        WeightedGroupResultDTO result = new WeightedGroupResultDTO(null, name, "RESULTS", percentage, subjects,
+                null, null, new WeightedGroupResultDTO.MarksTableDTO(columns, rows, totals), 0);
+        result.setMarksMissing(missing);
+        return result;
+    }
+
+    /**
+     * Section-aware competition ranks over the total of several exams (Σ obtained / Σ max) — the
+     * canonical ResultCalculator ranking on the canonical exam sheets; unranked with a mark missing.
+     */
+    private Map<String, Integer> aggregateRanks(List<ExamResultDTO> results) {
+        Long schoolId = securityUtil.getSchoolId();
+        Map<String, double[]> totals = new HashMap<>();
+        Map<String, Integer> missing = new HashMap<>();
+        Map<String, Long> section = new HashMap<>();
+        for (ExamResultDTO r : results) {
+            ExamConfig exam = examConfigRepo.findById(r.getExamId()).orElse(null);
+            if (exam == null || !schoolId.equals(exam.getSchoolId())) continue;
+            MarkService.ExamSheet sheet = markService.buildExamSheet(exam,
+                    subjectEntryRepo.findByExamConfigIdAndSchoolId(exam.getId(), schoolId));
+            for (MarkService.SheetRow row : sheet.rows()) {
+                if (row.entries().isEmpty()) continue;
+                String id = row.student().getStudentId();
+                double[] t = totals.computeIfAbsent(id, k -> new double[2]);
+                t[0] += row.score().obtained();
+                t[1] += row.score().max();
+                missing.merge(id, row.score().marksMissing(), Integer::sum);
+                section.put(id, row.sectionId());
+            }
+        }
+        Map<String, Double> pct = new HashMap<>();
+        totals.forEach((id, t) -> pct.put(id, missing.getOrDefault(id, 0) > 0 || t[1] <= 0 ? null : t[0] / t[1] * 100.0));
+        return ResultCalculator.competitionRanksWithin(pct, section::get);
     }
 
     // ── Grade helpers ─────────────────────────────────────────────────────

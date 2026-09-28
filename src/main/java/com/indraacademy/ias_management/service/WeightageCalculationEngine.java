@@ -265,6 +265,12 @@ public class WeightageCalculationEngine {
         List<GroupBreakdownDTO> groupBreakdowns = new ArrayList<>();
         double totalWeightedPct = 0.0;
         int marksMissing = 0;
+        // Subject summary for grouped cards (e.g. Annual = Term 1 + Term 2): the children's exam
+        // columns side by side, each subject's weighted % = Σ child subject % × child weight.
+        List<MarksTableDTO.ExamColumnDTO> columns = new ArrayList<>();
+        List<MarksTableDTO.ExamTotalDTO> totals = new ArrayList<>();
+        Map<String, List<MarksTableDTO.SubjectExamMarkDTO>> subjectCells = new LinkedHashMap<>();
+        Map<String, Double> subjectWeighted = new LinkedHashMap<>();
 
         for (AssessmentGroupComposition comp : compositions) {
             AssessmentGroup childGroup = groupRepo.findByIdAndSchoolId(comp.getChildGroupId(), schoolId)
@@ -274,6 +280,7 @@ public class WeightageCalculationEngine {
             WeightedGroupResultDTO childResult = compute(studentId, childGroup, session, schoolId, depth + 1);
             marksMissing += childResult.getMarksMissing();
             double weight = comp.getWeightage().doubleValue();
+            mergeChildTable(childResult, weight, columns, totals, subjectCells, subjectWeighted);
             double contribution = childResult.getWeightedPercentage() * weight;
             totalWeightedPct += contribution;
 
@@ -282,12 +289,105 @@ public class WeightageCalculationEngine {
                     childResult.getWeightedPercentage(), weight, contribution));
         }
 
+        List<MarksTableDTO.SubjectRowDTO> rows = new ArrayList<>();
+        List<SubjectWeightedResultDTO> subjectResults = new ArrayList<>();
+        subjectCells.forEach((subject, cells) -> {
+            double pct = subjectWeighted.getOrDefault(subject, 0.0);
+            rows.add(new MarksTableDTO.SubjectRowDTO(subject, cells, pct));
+            subjectResults.add(new SubjectWeightedResultDTO(subject, pct));
+        });
+        MarksTableDTO marksTable = columns.isEmpty() ? null : new MarksTableDTO(columns, rows, totals);
         WeightedGroupResultDTO result = new WeightedGroupResultDTO(
                 group.getId(), group.getName(), group.getGroupType(),
-                totalWeightedPct, Collections.emptyList(), null, groupBreakdowns, null, 0);
+                totalWeightedPct, subjectResults, null, groupBreakdowns, marksTable, 0);
         result.setMarksMissing(marksMissing);
         return result;
     }
+
+    /**
+     * Appends one child group's marks table to its parent's: the child's exam columns (weight
+     * scaled by the child's share), its totals, and per subject its cells (blank where the
+     * subject is not in that child) plus the child's subject % × the child's weight.
+     */
+    private static void mergeChildTable(WeightedGroupResultDTO child, double weight,
+                                        List<MarksTableDTO.ExamColumnDTO> columns,
+                                        List<MarksTableDTO.ExamTotalDTO> totals,
+                                        Map<String, List<MarksTableDTO.SubjectExamMarkDTO>> subjectCells,
+                                        Map<String, Double> subjectWeighted) {
+        MarksTableDTO table = child.getMarksTable();
+        if (table == null || table.getExamColumns() == null || table.getExamColumns().isEmpty()) return;
+        int before = columns.size();
+        int width = table.getExamColumns().size();
+        for (MarksTableDTO.ExamColumnDTO c : table.getExamColumns()) {
+            columns.add(new MarksTableDTO.ExamColumnDTO(c.getExamId(), c.getExamName(), c.getMaxTotal(), c.getWeightage() * weight));
+        }
+        totals.addAll(table.getExamTotals());
+        for (MarksTableDTO.SubjectRowDTO row : table.getSubjectRows()) {
+            List<MarksTableDTO.SubjectExamMarkDTO> cells = subjectCells.computeIfAbsent(row.getSubjectName(),
+                    k -> new ArrayList<>(Collections.nCopies(before, null)));
+            while (cells.size() < before) cells.add(null);
+            cells.addAll(row.getExamMarks());
+            subjectWeighted.merge(row.getSubjectName(), row.getWeightedPercentage() * weight, Double::sum);
+        }
+        // Subjects this child does not have stay blank in its columns.
+        subjectCells.values().forEach(cells -> { while (cells.size() < before + width) cells.add(null); });
+    }
+
+    // ── Class ranks (canonical, section-aware) ──────────────────────────
+
+    /**
+     * Rank of every student of the group's class by the group's weighted percentage, using the
+     * same ResultCalculator competition ranking as Class Results / My Results: within the
+     * student's section (the latest enrollment segment, from the exam sheets), rounded to 2 dp,
+     * ties share a rank, and a student with any missing mark is unranked. The weighted percentage
+     * is the one computeForStudent produces (Σ exam % × weight, recursively for groups), built
+     * from the canonical exam sheets in a few bulk queries per exam.
+     */
+    @Transactional(readOnly = true)
+    public Map<String, Integer> classRanks(Long groupId, String session) {
+        Long schoolId = securityUtil.getSchoolId();
+        AssessmentGroup group = groupRepo.findByIdAndSchoolId(groupId, schoolId)
+                .orElseThrow(() -> new NoSuchElementException("Assessment group not found: " + groupId));
+        Map<Long, MarkService.ExamSheet> sheets = new HashMap<>();
+        Map<String, Double> weighted = new HashMap<>();
+        Map<String, Integer> missing = new HashMap<>();
+        Map<String, Long> section = new HashMap<>();
+        accumulateClass(group, 1.0, schoolId, sheets, weighted, missing, section, 0);
+        Map<String, Double> percentage = new HashMap<>();
+        weighted.forEach((id, pct) -> percentage.put(id, missing.getOrDefault(id, 0) > 0 ? null : pct));
+        return ResultCalculator.competitionRanksWithin(percentage, section::get);
+    }
+
+    private void accumulateClass(AssessmentGroup group, double factor, Long schoolId,
+                                 Map<Long, MarkService.ExamSheet> sheets, Map<String, Double> weighted,
+                                 Map<String, Integer> missing, Map<String, Long> section, int depth) {
+        if (depth > 5) throw new IllegalStateException("Assessment group cycle detected at group: " + group.getId());
+        if ("EXAM_BASED".equals(group.getGroupType())) {
+            for (AssessmentGroupExamMapping mapping :
+                    mappingRepo.findByAssessmentGroupIdAndSchoolIdOrderByDisplayOrderAsc(group.getId(), schoolId)) {
+                ExamConfig exam = examConfigRepo.findById(mapping.getExamConfigId()).orElse(null);
+                if (exam == null || !schoolId.equals(exam.getSchoolId())) continue;
+                MarkService.ExamSheet sheet = sheets.computeIfAbsent(exam.getId(), id -> markService.buildExamSheet(
+                        exam, subjectEntryRepo.findByExamConfigIdAndSchoolId(id, schoolId)));
+                double weight = mapping.getWeightage().doubleValue() * factor;
+                for (MarkService.SheetRow row : sheet.rows()) {
+                    if (row.entries().isEmpty()) continue;
+                    String id = row.student().getStudentId();
+                    weighted.merge(id, row.score().percentageCountingMissingAsAbsent() * weight, Double::sum);
+                    missing.merge(id, row.score().marksMissing(), Integer::sum);
+                    section.put(id, row.sectionId());
+                }
+            }
+        } else {
+            for (AssessmentGroupComposition comp :
+                    compositionRepo.findByParentGroupIdAndSchoolIdOrderByDisplayOrderAsc(group.getId(), schoolId)) {
+                AssessmentGroup child = groupRepo.findByIdAndSchoolId(comp.getChildGroupId(), schoolId).orElse(null);
+                if (child != null) accumulateClass(child, factor * comp.getWeightage().doubleValue(),
+                        schoolId, sheets, weighted, missing, section, depth + 1);
+            }
+        }
+    }
+
 
     private WeightedGroupResultDTO emptyResult(AssessmentGroup group) {
         return new WeightedGroupResultDTO(

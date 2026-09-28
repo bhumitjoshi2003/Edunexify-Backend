@@ -46,7 +46,7 @@ import static org.mockito.Mockito.when;
 @AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
 @Import({ReportCardDataAssembler.class, MarkService.class, StudentTemporalMembershipResolver.class,
         AttendanceService.class, AcademicSessionService.class, ReportCardTemplateService.class,
-        WeightageCalculationEngine.class, RemarksService.class, ReportCardPublicationService.class,
+        WeightageCalculationEngine.class, RemarksService.class, ReportCardPublicationService.class, ReportCardPdfGenerator.class,
         com.indraacademy.ias_management.config.ClockConfig.class,
         ReportCardHistoricalPostgresIT.RealObjectMapperConfig.class})
 @EnabledIfEnvironmentVariable(named = "DB_URL", matches = ".+")
@@ -84,6 +84,8 @@ class ReportCardHistoricalPostgresIT {
     @Autowired RemarksService remarksService;
     @Autowired ReportCardPublicationService publicationService;
     @Autowired StudentRepository studentRepository;
+    @Autowired MarkService markService;
+    @Autowired ReportCardPdfGenerator pdfGenerator;
     @MockBean ObjectStorageService objectStorageService; // ReportCardDataAssembler's logo lookup
     @MockBean SecurityUtil securityUtil;
     @MockBean AuditService auditService;
@@ -355,6 +357,173 @@ class ReportCardHistoricalPostgresIT {
                 org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyString(),
                 org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyString(),
                 org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.any());
+        // Report Card Phase 0: the link opens exactly this student's card for this template/session
+        // (and the historical class), never a bare /dashboard/report-card or another student.
+        org.mockito.ArgumentCaptor<String> route = org.mockito.ArgumentCaptor.forClass(String.class);
+        verify(businessNotificationService).studentAndParents(
+                eq(SCHOOL), eq(STUDENT), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(),
+                org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyString(),
+                org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyString(), route.capture(),
+                org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.any());
+        assertThat(route.getValue()).isEqualTo("/dashboard/report-card?studentId=" + STUDENT + "&session=" + SESSION_PRIOR_LABEL
+                + "&templateId=" + TEMPLATE + "&classId=" + CLASS_9);
+        assertThat(route.getValue()).doesNotContain(LEGACY_STUDENT);
+    }
+
+    // ── Report Card Phase 0: canonical rank, grouped cards, results card ────
+
+    @Test
+    void reportCardRankIsTheCanonicalSectionRankSharedWithClassResults() {
+        insertClosedEnrollment(STUDENT, SESSION_PRIOR, CLASS_9, SECTION_A,
+                LocalDate.of(2025, 4, 1), LocalDate.of(2026, 3, 31), "SESSION_COMPLETED");
+        long exam = insertExamConfig(SCHOOL, SESSION_PRIOR_LABEL, "9", "Half Yearly");
+        jdbc.update("INSERT INTO assessment_group_exam_mapping (school_id,assessment_group_id,exam_config_id,weightage,display_order) VALUES (?,?,?,?,0)",
+                SCHOOL, ASSESSMENT_GROUP, exam, 1.0);
+        long math = insertSubjectEntry(exam, "Math", 100, LocalDate.of(2025, 9, 20));
+        insertMark(STUDENT, math, 90.0);
+        insertMark(LEGACY_STUDENT, math, 60.0);
+
+        ReportCardDataDTO top = assembler.assemble(STUDENT, TEMPLATE, SESSION_PRIOR_LABEL);
+        ReportCardDataDTO second = assembler.assemble(LEGACY_STUDENT, TEMPLATE, SESSION_PRIOR_LABEL);
+
+        Integer classResultsRank = markService.getStudentResults(STUDENT, SESSION_PRIOR_LABEL, true).get(0).getOverallRank();
+        Integer classResultsRank2 = markService.getStudentResults(LEGACY_STUDENT, SESSION_PRIOR_LABEL, true).get(0).getOverallRank();
+        assertThat(top.getWeightedResult().getRank()).isEqualTo(1).isEqualTo(classResultsRank);
+        assertThat(second.getWeightedResult().getRank()).isEqualTo(2).isEqualTo(classResultsRank2);
+        // Precomputed once for bulk / email: identical ranks.
+        var ranks = assembler.classRanksForTemplate(TEMPLATE, SESSION_PRIOR_LABEL);
+        assertThat(assembler.assemble(STUDENT, TEMPLATE, SESSION_PRIOR_LABEL, null, ranks).getWeightedResult().getRank()).isEqualTo(1);
+
+        // A student with a mark missing is unranked, exactly like Class Results.
+        long science = insertSubjectEntry(exam, "Science", 100, LocalDate.of(2025, 9, 21));
+        insertMark(STUDENT, science, 80.0);
+        entityManager.clear();
+        assertThat(assembler.assemble(LEGACY_STUDENT, TEMPLATE, SESSION_PRIOR_LABEL).getWeightedResult().getRank()).isZero();
+        assertThat(assembler.assemble(STUDENT, TEMPLATE, SESSION_PRIOR_LABEL).getWeightedResult().getRank()).isEqualTo(1);
+    }
+
+    @Test
+    void groupBasedCardHasSubjectRowsFromItsTerms() {
+        long term1 = ASSESSMENT_GROUP - 11, term2 = ASSESSMENT_GROUP - 12, annual = ASSESSMENT_GROUP - 13, annualTemplate = TEMPLATE - 13;
+        for (Object[] g : new Object[][]{{term1, "Term 1", "EXAM_BASED"}, {term2, "Term 2", "EXAM_BASED"}, {annual, "Annual", "GROUP_BASED"}}) {
+            jdbc.update("INSERT INTO assessment_group (id,school_id,session,class_name,name,group_type,display_order) VALUES (?,?,?,?,?,?,0)",
+                    g[0], SCHOOL, SESSION_CURRENT_LABEL, "9", g[1], g[2]);
+        }
+        jdbc.update("INSERT INTO assessment_group_composition (school_id,parent_group_id,child_group_id,weightage,display_order) VALUES (?,?,?,?,0)", SCHOOL, annual, term1, 0.5);
+        jdbc.update("INSERT INTO assessment_group_composition (school_id,parent_group_id,child_group_id,weightage,display_order) VALUES (?,?,?,?,1)", SCHOOL, annual, term2, 0.5);
+        jdbc.update("INSERT INTO report_card_template (id,school_id,name,assessment_group_id,is_default,is_active) VALUES (?,?,?,?,false,true)",
+                annualTemplate, SCHOOL, "Annual", annual);
+        long ex1 = insertExamConfig(SCHOOL, SESSION_PRIOR_LABEL, "9", "Half Yearly");
+        long ex2 = insertExamConfig(SCHOOL, SESSION_PRIOR_LABEL, "9", "Final");
+        jdbc.update("INSERT INTO assessment_group_exam_mapping (school_id,assessment_group_id,exam_config_id,weightage,display_order) VALUES (?,?,?,?,0)", SCHOOL, term1, ex1, 1.0);
+        jdbc.update("INSERT INTO assessment_group_exam_mapping (school_id,assessment_group_id,exam_config_id,weightage,display_order) VALUES (?,?,?,?,0)", SCHOOL, term2, ex2, 1.0);
+        insertMark(LEGACY_STUDENT, insertSubjectEntry(ex1, "Math", 100, null), 80.0);
+        insertMark(LEGACY_STUDENT, insertSubjectEntry(ex1, "Science", 100, null), 60.0);
+        insertMark(LEGACY_STUDENT, insertSubjectEntry(ex2, "Math", 100, null), 60.0);
+        insertMark(LEGACY_STUDENT, insertSubjectEntry(ex2, "Science", 100, null), 100.0);
+
+        ReportCardDataDTO dto = assembler.assemble(LEGACY_STUDENT, annualTemplate, SESSION_PRIOR_LABEL);
+
+        var table = dto.getWeightedResult().getMarksTable();
+        assertThat(table).isNotNull();
+        assertThat(table.getExamColumns()).extracting(c -> c.getExamName()).containsExactly("Half Yearly", "Final");
+        assertThat(table.getExamColumns()).extracting(c -> c.getWeightage()).containsExactly(0.5, 0.5);
+        assertThat(table.getSubjectRows()).extracting(r -> r.getSubjectName()).containsExactly("Math", "Science");
+        assertThat(table.getSubjectRows().get(0).getWeightedPercentage()).isEqualTo(70.0);
+        assertThat(table.getSubjectRows().get(1).getWeightedPercentage()).isEqualTo(80.0);
+        assertThat(table.getSubjectRows().get(0).getExamMarks()).extracting(m -> m.getObtained()).containsExactly(80.0, 60.0);
+        assertThat(table.getSubjectRows()).allSatisfy(r -> assertThat(r.getGrade()).isNotBlank());
+        assertThat(table.getExamTotals()).hasSize(2);
+        assertThat(dto.getWeightedResult().getWeightedPercentage()).isEqualTo(75.0);
+        assertThat(dto.getWeightedResult().getRank()).isEqualTo(1);
+    }
+
+    @Test
+    void resultsCardWithoutATemplateUsesTheCanonicalResultsAndRanks() {
+        long exam = insertExamConfig(SCHOOL, SESSION_PRIOR_LABEL, "9", "Half Yearly");
+        long math = insertSubjectEntry(exam, "Math", 100, null);
+        long sci = insertSubjectEntry(exam, "Science", 50, null);
+        insertMark(LEGACY_STUDENT, math, 72.0);
+        insertMark(LEGACY_STUDENT, sci, 45.0);
+
+        ReportCardDataDTO single = assembler.assembleFromResults(LEGACY_STUDENT, SESSION_PRIOR_LABEL, exam, null, true);
+        var result = markService.getStudentResults(LEGACY_STUDENT, SESSION_PRIOR_LABEL, true).get(0);
+        assertThat(single.getTemplate()).isNull();
+        assertThat(single.getClassName()).isEqualTo("9");
+        assertThat(single.getWeightedResult().getMarksTable().getExamColumns()).hasSize(1);
+        assertThat(single.getWeightedResult().getMarksTable().getSubjectRows()).extracting(r -> r.getSubjectName()).containsExactly("Math", "Science");
+        assertThat(single.getWeightedResult().getMarksTable().getSubjectRows()).extracting(r -> r.getGrade())
+                .containsExactly(result.getSubjects().get(0).getGrade(), result.getSubjects().get(1).getGrade());
+        assertThat(single.getWeightedResult().getWeightedPercentage()).isEqualTo(result.getPercentage());
+        assertThat(single.getOverallGrade()).isEqualTo(result.getGrade());
+        assertThat(single.getWeightedResult().getRank()).isEqualTo(result.getOverallRank()).isEqualTo(1);
+
+        // Every exam of the session as columns; students only ever see published ones.
+        long draft = insertExamConfig(SCHOOL, SESSION_PRIOR_LABEL, "9", "Unit Test");
+        jdbc.update("UPDATE exam_config SET result_status = 'DRAFT' WHERE id = ?", draft);
+        insertMark(LEGACY_STUDENT, insertSubjectEntry(draft, "Math", 20, null), 10.0);
+        entityManager.clear();
+        ReportCardDataDTO staffAll = assembler.assembleFromResults(LEGACY_STUDENT, SESSION_PRIOR_LABEL, null, null, true);
+        ReportCardDataDTO studentAll = assembler.assembleFromResults(LEGACY_STUDENT, SESSION_PRIOR_LABEL, null, null, false);
+        assertThat(staffAll.getWeightedResult().getMarksTable().getExamColumns()).hasSize(2);
+        assertThat(studentAll.getWeightedResult().getMarksTable().getExamColumns()).extracting(c -> c.getExamName()).containsExactly("Half Yearly");
+        assertThat(staffAll.getWeightedResult().getWeightedPercentage()).isEqualTo(127.0 / 170.0 * 100.0);
+        assertThat(staffAll.getWeightedResult().getRank()).isEqualTo(1);
+        assertThat(pdfGenerator.generate(staffAll)).isNotEmpty();
+    }
+
+    @Test
+    void titlesNameTheExamForOneExamAndAnnualForTheSession() {
+        long exam = insertExamConfig(SCHOOL, SESSION_PRIOR_LABEL, "9", "Half Yearly");
+        insertMark(LEGACY_STUDENT, insertSubjectEntry(exam, "Math", 100, null), 72.0);
+        jdbc.update("INSERT INTO assessment_group_exam_mapping (school_id,assessment_group_id,exam_config_id,weightage,display_order) VALUES (?,?,?,?,0)",
+                SCHOOL, ASSESSMENT_GROUP, exam, 1.0);
+
+        assertThat(assembler.assembleFromResults(LEGACY_STUDENT, SESSION_PRIOR_LABEL, exam, null, true).getReportTitle())
+                .isEqualTo("HALF YEARLY \u2014 REPORT CARD");
+        assertThat(assembler.assembleFromResults(LEGACY_STUDENT, SESSION_PRIOR_LABEL, null, null, true).getReportTitle())
+                .isEqualTo("ANNUAL REPORT CARD");
+        // Template card: its assessment group ("Annual" in this fixture) or the branding's exam term.
+        assertThat(assembler.assemble(LEGACY_STUDENT, TEMPLATE, SESSION_PRIOR_LABEL).getReportTitle()).isEqualTo("ANNUAL REPORT CARD");
+        jdbc.update("UPDATE report_card_template SET branding_json = ? WHERE id = ?", "{\"examTerm\":\"Half-Yearly\"}", TEMPLATE);
+        entityManager.clear();
+        assertThat(assembler.assemble(LEGACY_STUDENT, TEMPLATE, SESSION_PRIOR_LABEL).getReportTitle()).isEqualTo("HALF-YEARLY \u2014 REPORT CARD");
+    }
+
+    @Test
+    void onlyAPublishedTemplateCardCarriesTheVerificationQr() throws Exception {
+        long exam = insertExamConfig(SCHOOL, SESSION_PRIOR_LABEL, "9", "Half Yearly");
+        jdbc.update("INSERT INTO assessment_group_exam_mapping (school_id,assessment_group_id,exam_config_id,weightage,display_order) VALUES (?,?,?,?,0)",
+                SCHOOL, ASSESSMENT_GROUP, exam, 1.0);
+        insertMark(LEGACY_STUDENT, insertSubjectEntry(exam, "Math", 100, null), 72.0);
+
+        // Not yet published: no token, no QR (same lookup the PDF endpoint does).
+        assertThat(publicationService.getVerificationToken(TEMPLATE, SESSION_PRIOR_LABEL, "9")).isEmpty();
+        ReportCardDataDTO unpublished = assembler.assemble(LEGACY_STUDENT, TEMPLATE, SESSION_PRIOR_LABEL);
+        assertThat(ReportCardPdfGeneratorTest.qrTexts(pdfGenerator.generate(unpublished))).isEmpty();
+
+        // Published: the token exists and the PDF's QR opens the public verification page for it.
+        publicationService.publish(TEMPLATE, SESSION_PRIOR_LABEL, "9");
+        String token = publicationService.getVerificationToken(TEMPLATE, SESSION_PRIOR_LABEL, "9").orElseThrow();
+        ReportCardDataDTO published = assembler.assemble(LEGACY_STUDENT, TEMPLATE, SESSION_PRIOR_LABEL);
+        published.setVerificationToken(token);
+        assertThat(ReportCardPdfGeneratorTest.qrTexts(pdfGenerator.generate(published)))
+                .containsExactly("https://edunexify.co.in/verify-rc?token=" + token);
+        assertThat(publicationService.verifyByToken(token).isValid()).isTrue();
+
+        // A results-based card is not a publication: never a token, never a QR.
+        ReportCardDataDTO results = assembler.assembleFromResults(LEGACY_STUDENT, SESSION_PRIOR_LABEL, exam, null, true);
+        assertThat(results.getVerificationToken()).isNull();
+        assertThat(ReportCardPdfGeneratorTest.qrTexts(pdfGenerator.generate(results))).isEmpty();
+    }
+
+    @Test
+    void resultsCardWithNoVisibleResultsIsNotFound() {
+        long draft = insertExamConfig(SCHOOL, SESSION_PRIOR_LABEL, "9", "Unit Test");
+        jdbc.update("UPDATE exam_config SET result_status = 'DRAFT' WHERE id = ?", draft);
+        insertMark(LEGACY_STUDENT, insertSubjectEntry(draft, "Math", 20, null), 10.0);
+        assertThatThrownBy(() -> assembler.assembleFromResults(LEGACY_STUDENT, SESSION_PRIOR_LABEL, null, null, false))
+                .isInstanceOf(java.util.NoSuchElementException.class);
     }
 
     @Test

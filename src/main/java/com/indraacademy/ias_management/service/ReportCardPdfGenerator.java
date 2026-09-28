@@ -162,15 +162,15 @@ public class ReportCardPdfGenerator {
         // variable sections below use compact spacing so ordinary reports stay on one page.
         Document document = new Document(PageSize.A4, 36f, 36f, 30f, 24f);
         try {
+            // All per-document state (writer, token, branding) stays local to this call: the
+            // generator is a shared singleton used concurrently by single, bulk and email PDFs.
             PdfWriter writer = PdfWriter.getInstance(document, baos);
-            currentWriter = writer;
 
             BrandingConfig branding = parseBranding(data.getTemplate());
             // Populate session so the footer seal line can display it
             if (data.getSession() != null && !data.getSession().isBlank()) {
                 branding.session = data.getSession();
             }
-            currentVerificationToken = data.getVerificationToken();
 
             // Always draw parchment background; optionally add watermark on top
             String watermarkText = null;
@@ -196,16 +196,17 @@ public class ReportCardPdfGenerator {
                     .findFirst().orElse(null);
 
             // Single default Edunexify report-card design for every school.
-            addSchoolHeader(document, data, branding);
+            addSchoolHeader(document, writer, data, branding);
             addStudentInfo(document, data, branding);
             addMarksTable(document, data, branding);
             addAttendanceAndCoScholastic(document, data, coSection, branding);
             addAssessmentSummary(document, data, branding);
             addRemarks(document, "Class Teacher's Remarks", data.getTeacherRemarks(), branding);
             addRemarks(document, "Principal's Remarks", data.getPrincipalRemarks(), branding);
-            addBottomBalanceSpacer(document, data);
-            addPromotionStatus(document, data, branding);
-            addSignatures(document, branding);
+            addBottomBalanceSpacer(document, writer, data);
+            addPromotionStatus(document, writer, data, branding);
+            addQrVerification(document, writer, data.getVerificationToken());
+            addSignatures(document, writer, branding);
 
         } catch (Exception e) {
             log.error("PDF generation failed for student {}: {}", data.getStudentId(), e.getMessage(), e);
@@ -298,39 +299,15 @@ public class ReportCardPdfGenerator {
         }
     }
 
-    // ── Section dispatch ──────────────────────────────────────────────────
-
-    // Per-generation state (set in generate(), used by sub-methods)
-    private String currentVerificationToken;
-    private com.lowagie.text.pdf.PdfWriter currentWriter;
-
-    private void renderSection(Document doc, ReportCardDataDTO data,
-                                ReportCardTemplateDTO.SectionDTO section,
-                                BrandingConfig branding) throws DocumentException {
-        switch (section.getSectionType()) {
-            case "SCHOOL_HEADER"      -> addSchoolHeader(doc, data, branding);
-            case "STUDENT_INFO"       -> addStudentInfo(doc, data, branding);
-            case "MARKS_TABLE"        -> addMarksTable(doc, data, branding);
-            case "ASSESSMENT_SUMMARY" -> addAssessmentSummary(doc, data, branding);
-            case "ATTENDANCE"         -> { if (data.getAttendance() != null) addAttendance(doc, data, branding); }
-            case "CO_SCHOLASTIC"      -> addCoScholastic(doc, data, section, branding);
-            case "TEACHER_REMARKS"    -> addRemarks(doc, "Class Teacher's Remarks", data.getTeacherRemarks(), branding);
-            case "PRINCIPAL_REMARKS"  -> addRemarks(doc, "Principal's Remarks", data.getPrincipalRemarks(), branding);
-            case "PROMOTION_STATUS"   -> addPromotionStatus(doc, data, branding);
-            case "SIGNATURES"         -> addSignatures(doc, branding);
-            default -> {}
-        }
-    }
-
     // ── SCHOOL_HEADER ─────────────────────────────────────────────────────
     // Layout: [Logo] | [School name + details] | [REPORT CARD box]
     // Logo column is omitted when no logo URL is present.
     // Mirrors Angular: .rc-header-logo | .rc-header-center | rc-report-title-box
 
-    private void addSchoolHeader(Document doc, ReportCardDataDTO data,
+    private void addSchoolHeader(Document doc, PdfWriter writer, ReportCardDataDTO data,
                                   BrandingConfig branding) throws DocumentException {
         // Always use the elegant centered header — header image upload has been removed
-        addElegantHeader(doc, data, branding);
+        addElegantHeader(doc, writer, data, branding);
         return;
         // (dead code below retained for reference only)
     }
@@ -448,14 +425,16 @@ public class ReportCardPdfGenerator {
             // Gold rules bracket the title; the session sits below the lower rule.
             addHRule(doc, GOLD, 4);
             Font rcFont = FontFactory.getFont(FontFactory.TIMES_ROMAN, 12.5f, TEXT_DARK);
-            Paragraph rcTitle = new Paragraph("R E P O R T     C A R D", rcFont);
+            Paragraph rcTitle = new Paragraph(letterSpaced(reportTitle(data)), rcFont);
             rcTitle.setAlignment(Element.ALIGN_CENTER);
             rcTitle.setSpacingBefore(3);
             rcTitle.setSpacingAfter(4);
             doc.add(rcTitle);
             addHRule(doc, GOLD, 3);
 
-            String session = buildSessionLine(data, branding);
+            // The exam / term is in the title now; the line below carries the session only.
+            String session = data.getSession() != null && !data.getSession().isBlank()
+                    ? "Academic Session " + data.getSession() : "";
             if (!session.isBlank()) {
                 Font sessionFont = FontFactory.getFont(FontFactory.TIMES_ITALIC, 8.5f, TEXT_MID);
                 Paragraph sessionPara = new Paragraph(session, sessionFont);
@@ -516,6 +495,21 @@ public class ReportCardPdfGenerator {
         doc.add(band);
     }
 
+    static String reportTitle(ReportCardDataDTO data) {
+        return data.getReportTitle() != null && !data.getReportTitle().isBlank() ? data.getReportTitle() : "REPORT CARD";
+    }
+
+    /** "R E P O R T     C A R D" style; long exam names stay plain so the title fits one line. */
+    static String letterSpaced(String title) {
+        if (title.length() > 34) return title;
+        StringBuilder out = new StringBuilder();
+        for (String word : title.split(" ")) {
+            if (out.length() > 0) out.append("     ");
+            out.append(String.join(" ", word.split("")));
+        }
+        return out.toString();
+    }
+
     private String buildSessionLine(ReportCardDataDTO data, BrandingConfig branding) {
         StringBuilder meta = new StringBuilder();
         if (data.getSession() != null && !data.getSession().isBlank())
@@ -573,7 +567,7 @@ public class ReportCardPdfGenerator {
      * Elegant centered header for WARM_ELEGANCE and NAVY_SCHOLAR layouts.
      * Renders: [logo centered] → [school name large centered] → [motto italic] → [affiliation] → [title band]
      */
-    private void addElegantHeader(Document doc, ReportCardDataDTO data,
+    private void addElegantHeader(Document doc, PdfWriter writer, ReportCardDataDTO data,
                                    BrandingConfig branding) throws DocumentException {
         // Logo — centered above school name
         Image logoImage = loadLogoImage(data.getSchoolLogoUrl());
@@ -612,11 +606,11 @@ public class ReportCardPdfGenerator {
 
             // Draw the double circle directly on the canvas
             try {
-                com.lowagie.text.pdf.PdfContentByte cb = currentWriter.getDirectContent();
+                com.lowagie.text.pdf.PdfContentByte cb = writer.getDirectContent();
                 float pageWidth = doc.getPageSize().getWidth();
                 float cx = pageWidth / 2f;
                 // y position: after the spacer table — approximate from top
-                float cy = currentWriter.getVerticalPosition(false) + (circleSize / 2f) + 2f;
+                float cy = writer.getVerticalPosition(false) + (circleSize / 2f) + 2f;
                 float r1 = circleSize / 2f;       // outer ring radius
                 float r2 = r1 - 5f;               // inner ring radius
 
@@ -1437,13 +1431,13 @@ public class ReportCardPdfGenerator {
     // Centered stamp-style badge — mirrors Angular's rc-result-stamp.
     // New layouts: circular/oval badge with "PASSED WITH [GRADE] DISTINCTION".
 
-    private void addPromotionStatus(Document doc, ReportCardDataDTO data,
+    private void addPromotionStatus(Document doc, PdfWriter writer, ReportCardDataDTO data,
                                      BrandingConfig branding) throws DocumentException {
         WeightedGroupResultDTO wr = data.getWeightedResult();
         if (wr == null) return;
 
-        if (currentWriter != null) {
-            PdfContentByte cb = currentWriter.getDirectContent();
+        if (writer != null) {
+            PdfContentByte cb = writer.getDirectContent();
             float pageLeft = doc.left();
             float pageRight = doc.right();
             float pageWidth = pageRight - pageLeft;
@@ -1538,10 +1532,11 @@ public class ReportCardPdfGenerator {
         doc.add(outer);
     }
 
-    private Image createResultBadgeImage(String grade, String pctStr, boolean pass, Color resultColor) {
-        if (currentWriter == null) return null;
+    @SuppressWarnings("unused")
+    private Image createResultBadgeImage(PdfWriter writer, String grade, String pctStr, boolean pass, Color resultColor) {
+        if (writer == null) return null;
         try {
-            PdfTemplate tpl = currentWriter.getDirectContent().createTemplate(86, 86);
+            PdfTemplate tpl = writer.getDirectContent().createTemplate(86, 86);
             tpl.saveState();
             tpl.setColorStroke(resultColor);
             tpl.setLineWidth(1.3f);
@@ -1576,8 +1571,8 @@ public class ReportCardPdfGenerator {
         }
     }
 
-    private void addBottomBalanceSpacer(Document doc, ReportCardDataDTO data) throws DocumentException {
-        if (currentWriter == null) return;
+    private void addBottomBalanceSpacer(Document doc, PdfWriter writer, ReportCardDataDTO data) throws DocumentException {
+        if (writer == null) return;
         int marksRows = 0;
         int examCols = 0;
         if (data.getWeightedResult() != null && data.getWeightedResult().getMarksTable() != null) {
@@ -1588,7 +1583,7 @@ public class ReportCardPdfGenerator {
         boolean dense = marksRows > 6 || examCols > 2;
         if (dense) return;
 
-        float y = currentWriter.getVerticalPosition(false);
+        float y = writer.getVerticalPosition(false);
         float targetBeforeSignatures = 205f;
         if (y <= targetBeforeSignatures) return;
 
@@ -1605,7 +1600,7 @@ public class ReportCardPdfGenerator {
 
     // ── SIGNATURES ────────────────────────────────────────────────────────
 
-    private void addSignatures(Document doc, BrandingConfig branding) throws DocumentException {
+    private void addSignatures(Document doc, PdfWriter writer, BrandingConfig branding) throws DocumentException {
         // Note: CLASS TEACHER and PRINCIPAL signature lines are rendered inside addPromotionStatus.
         // This section only renders the footer seal line + branding.
 
@@ -1618,9 +1613,9 @@ public class ReportCardPdfGenerator {
 
         // "Powered by Edunexify" — gold, centered
         Font footerFont = FontFactory.getFont(FontFactory.TIMES_ROMAN, 6.5f, GOLD);
-        if (currentWriter != null) {
+        if (writer != null) {
             float centerX = (doc.left() + doc.right()) / 2f;
-            PdfContentByte cb = currentWriter.getDirectContent();
+            PdfContentByte cb = writer.getDirectContent();
             ColumnText.showTextAligned(cb, Element.ALIGN_CENTER,
                     new Phrase(sealLine, sealFont), centerX, doc.bottom() + 17f, 0);
             ColumnText.showTextAligned(cb, Element.ALIGN_CENTER,
@@ -1640,45 +1635,81 @@ public class ReportCardPdfGenerator {
         doc.add(footer);
     }
 
-    private void addQrVerification(Document doc, String token, BrandingConfig branding)
-            throws DocumentException {
-        String verifyUrl = frontendUrl.replaceAll("/$", "") + "/verify-rc?token=" + token;
+    /** Short, non-sensitive reference printed under the QR (the first block of the token). */
+    static String verificationReference(String token) {
+        if (token == null || token.isBlank()) return null;
+        int dash = token.indexOf('-');
+        return (dash > 0 ? token.substring(0, dash) : token.substring(0, Math.min(8, token.length()))).toUpperCase();
+    }
 
-        // Generate QR code as a byte array image
-        byte[] qrBytes = generateQrBytes(verifyUrl, 120);
-        if (qrBytes == null) return;
+    private static final String DEFAULT_FRONTEND_URL = "https://edunexify.co.in";
 
-        try {
-            Image qrImage = Image.getInstance(qrBytes);
-            qrImage.scaleToFit(60, 60);
-
-            // Layout: QR on right + "Verify authenticity" label
-            PdfPTable verifyTable = new PdfPTable(new float[]{3f, 1f});
-            verifyTable.setWidthPercentage(100);
-            verifyTable.setSpacingBefore(10);
-
-            // Left cell: verify text
-            PdfPCell textCell = new PdfPCell();
-            textCell.setBorder(Rectangle.NO_BORDER);
-            textCell.setVerticalAlignment(Element.ALIGN_BOTTOM);
-            Font verifyFont = FontFactory.getFont(FontFactory.TIMES_ITALIC, 7, TEXT_MID);
-            Paragraph vp = new Paragraph("Scan to verify authenticity of this report card.\n" + verifyUrl, verifyFont);
-            textCell.addElement(vp);
-            verifyTable.addCell(textCell);
-
-            // Right cell: QR image
-            PdfPCell qrCell = new PdfPCell(qrImage, true);
-            qrCell.setBorder(Rectangle.BOX);
-            qrCell.setBorderColor(BORDER_GRAY);
-            qrCell.setBorderWidth(0.5f);
-            qrCell.setPadding(3);
-            qrCell.setHorizontalAlignment(Element.ALIGN_RIGHT);
-            verifyTable.addCell(qrCell);
-
-            doc.add(verifyTable);
-        } catch (Exception e) {
-            log.warn("Failed to embed QR code in PDF: {}", e.getMessage());
+    /**
+     * Public verification URL encoded in the QR — the existing /verify-rc page and API. A missing
+     * or unresolved frontend.url (e.g. a literal "${FRONTEND_URL}" when the variable is unset)
+     * falls back to the production site so a printed QR is never a dead link.
+     */
+    String verificationUrl(String token) {
+        String base = frontendUrl != null ? frontendUrl.trim() : "";
+        if (!base.startsWith("https://") && !base.startsWith("http://")) {
+            log.warn("frontend.url is not a usable URL ({}); report-card QR codes use {}", base, DEFAULT_FRONTEND_URL);
+            base = DEFAULT_FRONTEND_URL;
         }
+        return base.replaceAll("/+$", "") + "/verify-rc?token="
+                + java.net.URLEncoder.encode(token, java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    /**
+     * QR code resolving to the public verification page, drawn in the blank centre between the
+     * two signature lines so it never pushes content onto a second page. The QR holds only the
+     * opaque token.
+     *
+     * Eligibility: only a PUBLISHED TEMPLATE report card has a verification token (the
+     * report_card_publication row), so only it carries a QR. A results-based card (no template —
+     * what Class Results / My Results open) is not a publication and has no token, and an
+     * unpublished template card has none yet: those render without a QR by design. Whenever a
+     * token IS present the verification is always printed — if the QR image itself cannot be
+     * built, the label and full verification link are printed instead and the failure is logged.
+     */
+    private void addQrVerification(Document doc, PdfWriter writer, String token) {
+        if (writer == null || token == null || token.isBlank()) return;   // not eligible: no token
+        byte[] qrBytes = generateQrBytes(verificationUrl(token), 180);
+        if (qrBytes == null) {
+            log.error("QR image could not be built for verification token ref {} — printing the link instead",
+                    verificationReference(token));
+            printVerificationLink(doc, writer, token);
+            return;
+        }
+        try {
+            float size = 46f;
+            float centerX = (doc.left() + doc.right()) / 2f;
+            float bottom = doc.bottom() + 36f;
+            Image qrImage = Image.getInstance(qrBytes);
+            qrImage.scaleAbsolute(size, size);
+            qrImage.setAbsolutePosition(centerX - size / 2f, bottom);
+            PdfContentByte cb = writer.getDirectContent();
+            cb.addImage(qrImage);
+            Font labelFont = FontFactory.getFont(FontFactory.TIMES_ROMAN, 6.2f, TEXT_MID);
+            ColumnText.showTextAligned(cb, Element.ALIGN_CENTER,
+                    new Phrase("Verify this report card  \u00b7  Ref " + verificationReference(token), labelFont),
+                    centerX, bottom - 8f, 0);
+        } catch (Exception e) {
+            log.error("Failed to embed QR code in PDF (ref {}): {} — printing the link instead",
+                    verificationReference(token), e.getMessage());
+            printVerificationLink(doc, writer, token);
+        }
+    }
+
+    /** Text fallback so a card with a token is never left without a way to verify it. */
+    private void printVerificationLink(Document doc, PdfWriter writer, String token) {
+        float centerX = (doc.left() + doc.right()) / 2f;
+        Font labelFont = FontFactory.getFont(FontFactory.TIMES_ROMAN, 6.2f, TEXT_MID);
+        PdfContentByte cb = writer.getDirectContent();
+        ColumnText.showTextAligned(cb, Element.ALIGN_CENTER,
+                new Phrase("Verify this report card  \u00b7  Ref " + verificationReference(token), labelFont),
+                centerX, doc.bottom() + 36f, 0);
+        ColumnText.showTextAligned(cb, Element.ALIGN_CENTER, new Phrase(verificationUrl(token), labelFont),
+                centerX, doc.bottom() + 28f, 0);
     }
 
     private byte[] generateQrBytes(String content, int size) {
@@ -1689,7 +1720,12 @@ public class ReportCardPdfGenerator {
             hints.put(EncodeHintType.ERROR_CORRECTION,
                       com.google.zxing.qrcode.decoder.ErrorCorrectionLevel.M);
             BitMatrix matrix = writer.encode(content, BarcodeFormat.QR_CODE, size, size, hints);
-            BufferedImage image = MatrixToImageWriter.toBufferedImage(matrix);
+            BufferedImage binary = MatrixToImageWriter.toBufferedImage(matrix);
+            // 8-bit grayscale, so the PDF stores the QR Flate-encoded — a 1-bit PNG becomes a
+            // CCITT-fax image, which not every PDF viewer/extractor handles.
+            BufferedImage image = new BufferedImage(binary.getWidth(), binary.getHeight(), BufferedImage.TYPE_BYTE_GRAY);
+            java.awt.Graphics2D g = image.createGraphics();
+            try { g.drawImage(binary, 0, 0, null); } finally { g.dispose(); }
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
             ImageIO.write(image, "PNG", baos);
             return baos.toByteArray();
