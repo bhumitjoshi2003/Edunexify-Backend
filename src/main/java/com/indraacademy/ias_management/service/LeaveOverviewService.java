@@ -67,6 +67,7 @@ public class LeaveOverviewService {
         if (substitutionService != null) {
             try {
                 for (UncoveredPeriod p : substitutionService.uncovered(today)) {
+                    if ("NO_LONGER_NEEDED".equals(p.state())) continue;
                     int[] counts = periods.computeIfAbsent(p.originalTeacherId(), k -> new int[2]);
                     counts[0]++;
                     if (p.assignment() == null) counts[1]++;

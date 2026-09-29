@@ -91,4 +91,28 @@ class TeacherSubstitutionNotificationListenerTest {
 
         assertThatCode(() -> listener.afterCommit(assignedEvent())).doesNotThrowAnyException();
     }
+
+    @Test
+    void substituteMessageCarriesClassPeriodTimeSubjectReplacedTeacherAndNote() {
+        ArgumentCaptor<String> message = ArgumentCaptor.forClass(String.class);
+        listener.afterCommit(new TeacherSubstitutionNotificationEvent(1L, 500L, 0L, "T2", "ASSIGNED",
+                "X", "A", "Maths", 3, "09:10", "09:50", "Mr Original", DATE, "A1", "Ms Sub", "Chapter 4 worksheet"));
+        verify(notifications).direct(anyLong(), anyString(), any(), any(), anyString(), message.capture(),
+                anyString(), anyString(), anyString(), anyString(), anyString(), any());
+        assertThat(message.getValue()).contains("Class X A", "Maths", "Period 3", "09:10", "09:50",
+                "Mr Original", "Chapter 4 worksheet");
+    }
+
+    @Test
+    void theOriginalTeacherIsToldWhoCoversTheirPeriod_withItsOwnDedupKey() {
+        ArgumentCaptor<String> message = ArgumentCaptor.forClass(String.class);
+        ArgumentCaptor<String> key = ArgumentCaptor.forClass(String.class);
+        listener.afterCommit(new TeacherSubstitutionNotificationEvent(1L, 500L, 0L, "T1", "ORIGINAL_ASSIGNED",
+                "X", "A", "Maths", 3, "09:10", "09:50", "Mr Original", DATE, "A1", "Ms Sub", null));
+        verify(notifications).direct(eq(1L), eq("T1"), eq(NotificationEventCode.TEACHER_SUBSTITUTION_ASSIGNED),
+                any(), anyString(), message.capture(), anyString(), anyString(), anyString(), anyString(),
+                key.capture(), eq(Set.of(ExternalDeliveryChannel.PUSH)));
+        assertThat(message.getValue()).contains("Ms Sub", "Class X A", "Period 3").doesNotContain("Note:");
+        assertThat(key.getValue()).isEqualTo("teacher-substitution:500:0:ORIGINAL_ASSIGNED:T1");
+    }
 }

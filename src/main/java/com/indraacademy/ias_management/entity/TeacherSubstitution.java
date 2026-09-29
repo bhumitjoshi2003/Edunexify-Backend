@@ -52,4 +52,19 @@ public class TeacherSubstitution {
     private LocalDateTime assignedAt;
     @UpdateTimestamp @Column(name = "updated_at", nullable = false)
     private LocalDateTime updatedAt;
+
+    /** Who removed the cover and when (assigned_by keeps who assigned it). */
+    @Column(name = "cancelled_by")
+    private String cancelledBy;
+
+    @Column(name = "cancelled_at")
+    private LocalDateTime cancelledAt;
+
+    /** Optional admin note for the substitute (≤ 300 characters). */
+    @Column(name = "note", length = 300)
+    private String note;
+
+    /** Why the original teacher was unavailable when the cover was assigned: LEAVE or ABSENCE. */
+    @Column(name = "reason_source", length = 20)
+    private String reasonSource;
 }

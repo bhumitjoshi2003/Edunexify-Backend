@@ -24,6 +24,21 @@ public class TeacherSubstitutionController {
         return service.uncovered(date);
     }
     @PreAuthorize("hasAnyRole('" + Role.ADMIN + "', '" + Role.SUB_ADMIN + "')")
+    @GetMapping("/overview")
+    public DayOverview overview(@RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date) {
+        return service.overview(date);
+    }
+    @PreAuthorize("hasAnyRole('" + Role.ADMIN + "', '" + Role.SUB_ADMIN + "')")
+    @GetMapping("/suggest-fill")
+    public FillPreview suggestFill(@RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date) {
+        return service.fillPreview(date);
+    }
+    @PreAuthorize("hasAnyRole('" + Role.ADMIN + "', '" + Role.SUB_ADMIN + "')")
+    @PostMapping("/bulk")
+    public BulkResult bulk(@Valid @RequestBody BulkRequest request, HttpServletRequest http) {
+        return service.assignMany(request, http);
+    }
+    @PreAuthorize("hasAnyRole('" + Role.ADMIN + "', '" + Role.SUB_ADMIN + "')")
     @GetMapping("/free-teachers")
     public List<FreeTeacher> freeTeachers(@RequestParam Long timetableEntryId,
             @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date) {
@@ -47,5 +62,11 @@ public class TeacherSubstitutionController {
     @GetMapping("/mine")
     public List<Assignment> mine(@RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date) {
         return service.mine(date);
+    }
+
+    @PreAuthorize("hasRole('" + Role.TEACHER + "')")
+    @GetMapping("/my-coverage")
+    public MyCoverage myCoverage(@RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date) {
+        return service.myCoverage(date);
     }
 }
