@@ -28,6 +28,9 @@ public class AcademicSessionController {
     @Autowired
     private ClassTeacherActivationService classTeacherActivationService;
 
+    @Autowired
+    private com.indraacademy.ias_management.service.SessionReadinessService sessionReadinessService;
+
     @GetMapping
     @PreAuthorize("hasAnyRole('ADMIN', 'TEACHER', 'STUDENT', 'PARENT', 'SUB_ADMIN')")
     public ResponseEntity<List<AcademicSessionDto>> getAllSessions() {
@@ -62,6 +65,14 @@ public class AcademicSessionController {
     @PreAuthorize("hasRole('ADMIN')")
     public ResponseEntity<ActivationPreviewResult> getActivationPreview(@PathVariable Long sessionId) {
         return ResponseEntity.ok(classTeacherActivationService.previewForSession(sessionId));
+    }
+
+    /** Read-only readiness warnings shown before "Make Current" (never blocks the switch). */
+    @GetMapping("/{sessionId}/readiness")
+    @PreAuthorize("hasRole('ADMIN')")
+    public ResponseEntity<com.indraacademy.ias_management.service.SessionReadinessService.Readiness> getReadiness(
+            @PathVariable Long sessionId) {
+        return ResponseEntity.ok(sessionReadinessService.readiness(sessionId));
     }
 
     @DeleteMapping("/{sessionId}")

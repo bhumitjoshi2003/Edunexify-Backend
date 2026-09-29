@@ -21,6 +21,7 @@ import java.util.List;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.*;
 
@@ -209,6 +210,31 @@ class StudentPromotionServiceTest {
                 PromotionDecisionRequest.class,HttpServletRequest.class).getAnnotation(PreAuthorize.class);
         assertThat(preview.value()).isEqualTo("hasRole('ADMIN')");
         assertThat(execute.value()).isEqualTo("hasRole('ADMIN')");
+    }
+
+    @Test void pendingAndExitDecisionsNeverReachTheYearEndWorker(){
+        var response=service.executePromotion(batch(decision("S1",StudentYearEndDecision.Action.PENDING),
+                decision("S2",StudentYearEndDecision.Action.TRANSFER)),servletRequest);
+        assertThat(response.outcomes()).extracting(o->o.code()).containsExactly("PENDING","VALIDATION_ERROR");
+        assertThat(response.summary()).containsEntry("PENDING",1L);
+        assertThat(response.run()).isNull();                          // no run repository in this narrow test
+        verifyNoInteractions(worker);
+    }
+
+    @Test void withdrawIsNotAYearEndDecision(){
+        var json=new com.fasterxml.jackson.databind.ObjectMapper();
+        assertThatThrownBy(()->json.readValue("{\"studentId\":\"S1\",\"action\":\"WITHDRAW\"}",PromotionDecisionRequest.Decision.class))
+                .isInstanceOf(com.fasterxml.jackson.databind.exc.InvalidFormatException.class);
+        assertThat(StudentYearEndDecision.Action.values()).extracting(Enum::name)
+                .containsExactly("PROMOTE","DETAIN","PASS_OUT","TRANSFER","PENDING");
+    }
+
+    @Test void yearEndServiceRejectsNonMembershipActions(){
+        var yearEnd=new StudentYearEndService(null,null,null,null,null,null,null,null,null);
+        for(var action:List.of(StudentYearEndDecision.Action.TRANSFER,StudentYearEndDecision.Action.PENDING)){
+            assertThatThrownBy(()->yearEnd.apply(new StudentYearEndDecision.Request(1L,"S1",11L,12L,1001L,91L,action,null,null,null)))
+                    .as(action.name()).isInstanceOf(IllegalArgumentException.class).hasMessageContaining("only PROMOTE, DETAIN or PASS_OUT");
+        }
     }
 
     private PromotionDecisionRequest batch(PromotionDecisionRequest.Decision... decisions){var b=new PromotionDecisionRequest();b.setSourceSessionId(11L);b.setTargetSessionId(12L);b.setDecisions(List.of(decisions));return b;}

@@ -54,6 +54,7 @@ public class StudentController {
     @Autowired private StudentService studentService;
     @Autowired private StudentBulkImportService studentBulkImportService;
     @Autowired private StudentPromotionService studentPromotionService;
+    @Autowired(required = false) private com.indraacademy.ias_management.service.PromotionResultContextService promotionResultContext;
     @Autowired private PasswordEncoder passwordEncoder;
     @Autowired private StudentRepository studentRepository;
     @Autowired private UserRepository userRepository;
@@ -235,8 +236,20 @@ public class StudentController {
             @RequestParam(required = false) String studentId) {
         log.info("Request for student promotion preview: sourceSessionId={}, targetSessionId={}",
                 sourceSessionId, targetSessionId);
-        return ResponseEntity.ok(studentPromotionService.getPromotionPreview(
-                sourceSessionId, targetSessionId, classId, studentId));
+        PromotionPreviewDTO preview = studentPromotionService.getPromotionPreview(
+                sourceSessionId, targetSessionId, classId, studentId);
+        // Read-only result context (published report card / published results), added after the
+        // preview's own transaction; it never affects which decisions are allowed.
+        if (promotionResultContext != null) {
+            preview = promotionResultContext.enrich(securityUtil.getSchoolId(), preview);
+        }
+        return ResponseEntity.ok(preview);
+    }
+
+    @PreAuthorize("hasRole('" + Role.ADMIN + "')")
+    @GetMapping("/promotion/runs")
+    public ResponseEntity<List<PromotionResultDTO.RunSummary>> getPromotionRuns(@RequestParam Long targetSessionId) {
+        return ResponseEntity.ok(studentPromotionService.recentRuns(targetSessionId));
     }
 
     @PreAuthorize("hasRole('" + Role.ADMIN + "')")

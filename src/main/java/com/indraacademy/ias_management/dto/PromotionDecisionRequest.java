@@ -12,12 +12,16 @@ public class PromotionDecisionRequest {
     @NotNull private Long sourceSessionId;
     @NotNull private Long targetSessionId;
     @NotEmpty @Valid private List<Decision> decisions;
+    /** Optional source-class filter the batch was prepared with (recorded on the rollover run). */
+    private Long classId;
 
     public Long getSourceSessionId() { return sourceSessionId; }
     public void setSourceSessionId(Long sourceSessionId) { this.sourceSessionId = sourceSessionId; }
     public Long getTargetSessionId() { return targetSessionId; }
     public void setTargetSessionId(Long targetSessionId) { this.targetSessionId = targetSessionId; }
     public List<Decision> getDecisions() { return decisions; }
+    public Long getClassId() { return classId; }
+    public void setClassId(Long classId) { this.classId = classId; }
     public void setDecisions(List<Decision> decisions) { this.decisions = decisions; }
 
     public static class Decision {
@@ -27,6 +31,10 @@ public class PromotionDecisionRequest {
         @NotNull private Long expectedSourceClassId;
         private Long targetClassId;
         private Long targetSectionId;
+        /** TRANSFER only: the reason recorded for the exit, and optionally the leaving date — which,
+         *  if sent, must equal the source session end (the only effective date allowed). */
+        private java.time.LocalDate leavingDate;
+        @jakarta.validation.constraints.Size(max = 500) private String reason;
 
         public String getStudentId() { return studentId; }
         public void setStudentId(String studentId) { this.studentId = studentId; }
@@ -40,5 +48,9 @@ public class PromotionDecisionRequest {
         public void setTargetClassId(Long targetClassId) { this.targetClassId = targetClassId; }
         public Long getTargetSectionId() { return targetSectionId; }
         public void setTargetSectionId(Long targetSectionId) { this.targetSectionId = targetSectionId; }
+        public java.time.LocalDate getLeavingDate() { return leavingDate; }
+        public void setLeavingDate(java.time.LocalDate leavingDate) { this.leavingDate = leavingDate; }
+        public String getReason() { return reason; }
+        public void setReason(String reason) { this.reason = reason; }
     }
 }

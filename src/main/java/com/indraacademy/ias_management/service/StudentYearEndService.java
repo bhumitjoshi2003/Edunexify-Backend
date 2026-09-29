@@ -153,6 +153,69 @@ public class StudentYearEndService {
         return result(Outcome.PASSED_OUT, "Graduation finalized", source.getId(), null, false);
     }
 
+    /**
+     * Scheduler seam for a year-end TRANSFER recorded before its source session ended
+     * (see {@link StudentYearEndExitWorker}): once the session end date is reached, the student's
+     * status becomes TRANSFERRED with that leaving date and parent access ends — the
+     * same effects as the normal exit, whose enrollment closure was already recorded. Idempotent.
+     */
+    @Transactional
+    public Result finalizeYearEndExit(Long schoolId, String studentId, Long sourceSessionId,
+                                      Long sourceEnrollmentId, AuditContext auditContext) {
+        if (schoolId == null || studentId == null || studentId.isBlank()
+                || sourceSessionId == null || sourceEnrollmentId == null) {
+            throw new IllegalArgumentException("schoolId, studentId, sourceSessionId and sourceEnrollmentId are required");
+        }
+        School school = schools.findById(schoolId)
+                .orElseThrow(() -> new NoSuchElementException("School not found"));
+        Student student = students.findByStudentIdAndSchoolIdForUpdate(studentId, schoolId)
+                .orElseThrow(() -> new NoSuchElementException("Student not found for school"));
+        AcademicSession sourceSession = sessions.findByIdAndSchoolId(sourceSessionId, schoolId)
+                .orElseThrow(() -> new NoSuchElementException("Source session not found for school"));
+        List<StudentEnrollment> history = enrollments.findAllHistoryForUpdate(schoolId, studentId);
+        StudentEnrollment source = history.stream()
+                .filter(e -> Objects.equals(e.getId(), sourceEnrollmentId))
+                .filter(e -> Objects.equals(e.getAcademicSessionId(), sourceSessionId))
+                .findFirst().orElse(null);
+        if (source == null || source.getStatus() != StudentEnrollmentStatus.CLOSED
+                || source.getClosureReason() != StudentEnrollmentClosureReason.TRANSFERRED
+                || !Objects.equals(source.getEffectiveUntil(), sourceSession.getEndDate())) {
+            return result(Outcome.INVALID_SOURCE, "No recorded year-end transfer exists",
+                    sourceEnrollmentId, null, false);
+        }
+        StudentStatus exitStatus = StudentStatus.TRANSFERRED;
+        boolean laterSegmentExists = history.stream()
+                .filter(e -> !Objects.equals(e.getId(), source.getId()))
+                .filter(e -> e.getStatus() != StudentEnrollmentStatus.CANCELLED)
+                .anyMatch(e -> e.getEffectiveFrom().isAfter(source.getEffectiveUntil()));
+        if (laterSegmentExists) {
+            return result(Outcome.CONFLICT,
+                    "Student has a later enrollment segment — this scheduled exit is stale",
+                    source.getId(), null, false);
+        }
+        if (student.getStatus() == exitStatus && Objects.equals(student.getLeavingDate(), source.getEffectiveUntil())) {
+            return result(Outcome.ALREADY_APPLIED, "Exit is already finalized", source.getId(), null, false);
+        }
+        if (student.getStatus() != StudentStatus.ACTIVE) {
+            return result(Outcome.CONFLICT, "Student lifecycle changed after the exit was scheduled",
+                    source.getId(), null, false);
+        }
+        LocalDate today = LocalDate.now(clock.withZone(SchoolTimeUtil.zoneId(school)));
+        if (today.isBefore(source.getEffectiveUntil())) {
+            return result(Outcome.ALREADY_APPLIED, "Exit is recorded and awaits its effective date",
+                    source.getId(), null, true);
+        }
+        student.setStatus(exitStatus);
+        student.setLeavingDate(source.getEffectiveUntil());
+        if (student.getReasonForLeaving() == null || student.getReasonForLeaving().isBlank()) {
+            student.setReasonForLeaving("Transferred at year end");
+        }
+        students.saveAndFlush(student);
+        parentPortal.endRelationshipsForExitedStudent(schoolId, studentId, source.getEffectiveUntil());
+        audit(auditContext, "FINALIZE_YEAR_END_" + exitStatus.name(), studentId, "ACTIVE", exitStatus.name());
+        return result(Outcome.TRANSFERRED, "Transfer finalized", source.getId(), null, false);
+    }
+
     private Result applyContinuing(Request request, Student student, AcademicSession sourceSession,
                                    StudentEnrollment source, List<StudentEnrollment> history,
                                    LocalDate today) {
@@ -355,6 +418,9 @@ public class StudentYearEndService {
                 || request.expectedSourceEnrollmentId() == null
                 || request.expectedSourceClassId() == null || request.action() == null) {
             throw new IllegalArgumentException("Complete year-end source identity and action are required");
+        }
+        if (!request.action().isYearEndMembershipAction()) {
+            throw new IllegalArgumentException("Year-end service applies only PROMOTE, DETAIN or PASS_OUT");
         }
     }
 

@@ -67,6 +67,7 @@ public class StudentStatusScheduler {
                     new EnumMap<>(StudentEnrollmentService.ScheduledActivationOutcome.class);
             int invalidSession=0, invalidMembership=0, conflicts=0, failures=0;
             int graduationFinalized=0, graduationAlreadyFinalized=0, graduationInvalid=0;
+            int yearEndExitsFinalized=0, yearEndExitsInvalid=0;
             for (School school : schoolRepository.findAll()) {
                 if (!school.isActive()) continue;
                 LocalDate today = LocalDate.now(clock.withZone(SchoolTimeUtil.zoneId(school)));
@@ -136,6 +137,26 @@ public class StudentStatusScheduler {
                                 e.getClass().getSimpleName());
                     }
                 }
+                // Year-end TRANSFER recorded before the session ended, now effective.
+                for (var exit : enrollmentService.findDueYearEndExitEnrollments(school.getId(), today)) {
+                    try {
+                        var result = yearEndService.finalizeYearEndExit(school.getId(), exit.getStudentId(),
+                                exit.getAcademicSessionId(), exit.getId(),
+                                new StudentYearEndDecision.AuditContext("SYSTEM", "SYSTEM", "SCHEDULER"));
+                        switch (result.outcome()) {
+                            case TRANSFERRED -> yearEndExitsFinalized++;
+                            case ALREADY_APPLIED -> { }
+                            default -> yearEndExitsInvalid++;
+                        }
+                    } catch (Exception e) {
+                        failures++;
+                        log.warn("Scheduled year-end exit skipped: schoolId={}, studentId={}, enrollmentId={}, type={}",
+                                school.getId(), exit.getStudentId(), exit.getId(), e.getClass().getSimpleName());
+                    }
+                }
+            }
+            if (yearEndExitsFinalized + yearEndExitsInvalid > 0) {
+                log.info("StudentStatusScheduler year-end exits: finalized={}, invalid={}", yearEndExitsFinalized, yearEndExitsInvalid);
             }
             log.info("StudentStatusScheduler completed: admissionActivated={}, continuingActivated={}, alreadyActive={}, noPlanned={}, expiredTargetSession={}, notEligible={}, graduationFinalized={}, graduationAlreadyFinalized={}, graduationInvalid={}, invalidSession={}, invalidMembership={}, conflict={}, failure={}",
                     outcomes.getOrDefault(StudentEnrollmentService.ScheduledActivationOutcome.ACTIVATED,0),

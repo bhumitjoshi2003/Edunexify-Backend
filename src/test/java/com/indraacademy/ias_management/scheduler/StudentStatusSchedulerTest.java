@@ -78,6 +78,8 @@ class StudentStatusSchedulerTest {
         verify(enrollments).findEligiblePlannedStudentIds(2L,LocalDate.of(2026,9,5));
         verify(enrollments).findDueGraduationEnrollments(1L,LocalDate.of(2026,9,6));
         verify(enrollments).findDueGraduationEnrollments(2L,LocalDate.of(2026,9,5));
+        verify(enrollments).findDueYearEndExitEnrollments(1L,LocalDate.of(2026,9,6));
+        verify(enrollments).findDueYearEndExitEnrollments(2L,LocalDate.of(2026,9,5));
         verify(students).findBySchoolIdAndStatusAndJoiningDateLessThanEqualOrderByStudentId(
                 2L,StudentStatus.UPCOMING,LocalDate.of(2026,9,5));
         verifyNoMoreInteractions(enrollments);

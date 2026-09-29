@@ -35,6 +35,12 @@ public class StudentPromotionService {
     private final StudentYearEndWorker worker;
     private final SecurityUtil security;
     private final Clock clock;
+    /** Optional collaborators (absent in narrow unit/slice tests): the year-end exit path, the
+     *  rollover run record. Without them TRANSFER is rejected and no run is recorded. */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private StudentYearEndExitWorker exitWorker;
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private com.indraacademy.ias_management.repository.StudentRolloverRunRepository runs;
 
     public StudentPromotionService(
             StudentRepository students, StudentEnrollmentRepository enrollments,
@@ -92,16 +98,46 @@ public class StudentPromotionService {
                 uncoveredForFilter(schoolId, studentId, sourceByStudent.keySet()));
     }
 
-    /** Intentionally non-transactional: each worker invocation owns REQUIRES_NEW. */
+    /**
+     * Intentionally non-transactional: each worker invocation owns REQUIRES_NEW, and the rollover
+     * run record is written before and after the batch (so a partially applied batch is still
+     * recorded with accurate counts).
+     */
     public PromotionResultDTO executePromotion(PromotionDecisionRequest batch, HttpServletRequest request) {
         Long schoolId = security.getSchoolId();
         StudentYearEndDecision.AuditContext actor = new StudentYearEndDecision.AuditContext(
                 security.getUsername(), security.getRole(), request.getRemoteAddr());
+        StudentRolloverRun run = startRun(schoolId, batch, actor.username());
         List<PromotionResultDTO.StudentOutcome> outcomes = new ArrayList<>();
+        try {
+            applyDecisions(schoolId, batch, request, actor, outcomes);
+        } catch (RuntimeException e) {
+            finishRun(run, outcomes, StudentRolloverRun.Status.FAILED);
+            throw e;
+        }
+        Map<String,Long> summary = outcomes.stream().collect(Collectors.groupingBy(
+                PromotionResultDTO.StudentOutcome::code, LinkedHashMap::new, Collectors.counting()));
+        StudentRolloverRun finished = finishRun(run, outcomes, null);
+        return new PromotionResultDTO(outcomes.size(), summary, outcomes, runSummary(finished));
+    }
+
+    private void applyDecisions(Long schoolId, PromotionDecisionRequest batch, HttpServletRequest request,
+                                StudentYearEndDecision.AuditContext actor,
+                                List<PromotionResultDTO.StudentOutcome> outcomes) {
         Set<String> seen = new HashSet<>();
         for (PromotionDecisionRequest.Decision decision : batch.getDecisions()) {
             if (!seen.add(decision.getStudentId())) {
                 outcomes.add(validationOutcome(decision.getStudentId(), "Duplicate student decision in batch"));
+                continue;
+            }
+            if (decision.getAction() == StudentYearEndDecision.Action.PENDING) {
+                // Explicit "decide later": no enrollment change at all, but counted and reported.
+                outcomes.add(new PromotionResultDTO.StudentOutcome(decision.getStudentId(), OUTCOME_PENDING,
+                        "Kept pending — no change recorded", decision.getExpectedSourceEnrollmentId(), null, null, false));
+                continue;
+            }
+            if (decision.getAction() == StudentYearEndDecision.Action.TRANSFER) {
+                outcomes.add(applyExit(schoolId, batch, decision, request));
                 continue;
             }
             // The external batch always carries one explicit targetSessionId (it represents the
@@ -138,9 +174,103 @@ public class StudentPromotionService {
                         decision.getExpectedSourceEnrollmentId(), null, null, false));
             }
         }
-        Map<String,Long> summary = outcomes.stream().collect(Collectors.groupingBy(
-                PromotionResultDTO.StudentOutcome::code, LinkedHashMap::new, Collectors.counting()));
-        return new PromotionResultDTO(outcomes.size(), summary, outcomes);
+    }
+
+    static final String OUTCOME_PENDING = "PENDING";
+
+    /** TRANSFER through the year-end exit path, one transaction per student. */
+    private PromotionResultDTO.StudentOutcome applyExit(Long schoolId, PromotionDecisionRequest batch,
+                                                        PromotionDecisionRequest.Decision decision,
+                                                        HttpServletRequest request) {
+        if (exitWorker == null) {
+            return validationOutcome(decision.getStudentId(), "Transfer is not available");
+        }
+        try {
+            return exitWorker.apply(schoolId, batch.getSourceSessionId(), decision, request);
+        } catch (IllegalArgumentException | NoSuchElementException e) {
+            return validationOutcome(decision.getStudentId(), e.getMessage());
+        } catch (IllegalStateException e) {
+            return new PromotionResultDTO.StudentOutcome(decision.getStudentId(),
+                    StudentYearEndDecision.Outcome.CONFLICT.name(), e.getMessage(),
+                    decision.getExpectedSourceEnrollmentId(), null, null, false);
+        } catch (Exception e) {
+            log.error("Year-end exit failed: schoolId={}, studentId={}, type={}",
+                    schoolId, decision.getStudentId(), e.getClass().getSimpleName());
+            return new PromotionResultDTO.StudentOutcome(decision.getStudentId(), "VALIDATION_ERROR",
+                    "Decision could not be applied", decision.getExpectedSourceEnrollmentId(), null, null, false);
+        }
+    }
+
+    // ── Rollover run record (audit/reporting only) ──────────────────────────
+
+    private StudentRolloverRun startRun(Long schoolId, PromotionDecisionRequest batch, String startedBy) {
+        if (runs == null) return null;
+        if (sessions.findByIdAndSchoolId(batch.getSourceSessionId(), schoolId).isEmpty()
+                || sessions.findByIdAndSchoolId(batch.getTargetSessionId(), schoolId).isEmpty()) {
+            throw new NoSuchElementException("Source or target session not found for school");
+        }
+        if (Objects.equals(batch.getSourceSessionId(), batch.getTargetSessionId())) {
+            throw new IllegalArgumentException("Source and target sessions must differ");
+        }
+        if (batch.getClassId() != null && classes.findByIdAndSchoolId(batch.getClassId(), schoolId).isEmpty()) {
+            throw new NoSuchElementException("Class not found for school");
+        }
+        StudentRolloverRun run = new StudentRolloverRun();
+        run.setSchoolId(schoolId);
+        run.setSourceSessionId(batch.getSourceSessionId());
+        run.setTargetSessionId(batch.getTargetSessionId());
+        run.setClassId(batch.getClassId());
+        run.setStartedBy(startedBy);
+        run.setStartedAt(java.time.LocalDateTime.now());
+        run.setStatus(StudentRolloverRun.Status.RUNNING);
+        run.setTotalStudents(batch.getDecisions() == null ? 0 : batch.getDecisions().size());
+        return runs.saveAndFlush(run);
+    }
+
+    private StudentRolloverRun finishRun(StudentRolloverRun run, List<PromotionResultDTO.StudentOutcome> outcomes,
+                                         StudentRolloverRun.Status forced) {
+        if (run == null) return null;
+        Map<String, Long> byCode = outcomes.stream().collect(Collectors.groupingBy(
+                PromotionResultDTO.StudentOutcome::code, Collectors.counting()));
+        java.util.function.ToIntFunction<String> n = code -> byCode.getOrDefault(code, 0L).intValue();
+        run.setPromotedCount(n.applyAsInt(StudentYearEndDecision.Outcome.PROMOTED.name()));
+        run.setDetainedCount(n.applyAsInt(StudentYearEndDecision.Outcome.DETAINED.name()));
+        run.setPassOutCount(n.applyAsInt(StudentYearEndDecision.Outcome.PASSED_OUT.name()));
+        run.setTransferCount(n.applyAsInt("TRANSFERRED"));
+        run.setPendingCount(n.applyAsInt(OUTCOME_PENDING));
+        run.setAlreadyAppliedCount(n.applyAsInt(StudentYearEndDecision.Outcome.ALREADY_APPLIED.name()));
+        int failed = n.applyAsInt(StudentYearEndDecision.Outcome.CONFLICT.name())
+                + n.applyAsInt(StudentYearEndDecision.Outcome.INVALID_SOURCE.name())
+                + n.applyAsInt("VALIDATION_ERROR");
+        run.setFailedCount(failed);
+        run.setFinishedAt(java.time.LocalDateTime.now());
+        run.setStatus(forced != null ? forced
+                : failed > 0 ? StudentRolloverRun.Status.COMPLETED_WITH_ERRORS : StudentRolloverRun.Status.COMPLETED);
+        try {
+            return runs.saveAndFlush(run);
+        } catch (RuntimeException e) {
+            // The decisions are already applied; a failure to update the audit row must not hide them.
+            log.error("Could not finalize rollover run {}: {}", run.getId(), e.getMessage());
+            return run;
+        }
+    }
+
+    static PromotionResultDTO.RunSummary runSummary(StudentRolloverRun r) {
+        if (r == null) return null;
+        return new PromotionResultDTO.RunSummary(r.getId(), r.getStatus().name(), r.getSourceSessionId(),
+                r.getTargetSessionId(), r.getClassId(), r.getStartedBy(), r.getStartedAt(), r.getFinishedAt(),
+                r.getTotalStudents(), r.getPromotedCount(), r.getDetainedCount(), r.getPassOutCount(),
+                r.getTransferCount(), r.getPendingCount(), r.getAlreadyAppliedCount(),
+                r.getFailedCount());
+    }
+
+    /** Recent rollover runs into a target session (newest first). */
+    @Transactional(readOnly = true)
+    public List<PromotionResultDTO.RunSummary> recentRuns(Long targetSessionId) {
+        if (runs == null) return List.of();
+        Long schoolId = security.getSchoolId();
+        return runs.findTop20BySchoolIdAndTargetSessionIdOrderByStartedAtDescIdDesc(schoolId, targetSessionId)
+                .stream().map(StudentPromotionService::runSummary).toList();
     }
 
     @Transactional
@@ -204,7 +334,7 @@ public class StudentPromotionService {
                 promoteTarget == null ? null : promoteTarget.getName(),
                 sourceClass == null ? null : sourceClass.getId(), source.getClassNameSnapshot(),
                 promoteSectionRequired, null, detainSection, proposedStatus,
-                List.copyOf(errors), List.copyOf(warnings), appliedState);
+                List.copyOf(errors), List.copyOf(warnings), appliedState, null);
     }
 
     private StudentEnrollment selectYearEndSource(List<StudentEnrollment> history) {
@@ -213,13 +343,18 @@ public class StudentPromotionService {
                 .orElseGet(() -> history.stream()
                         .filter(e -> e.getStatus() == StudentEnrollmentStatus.CLOSED)
                         .filter(e -> e.getClosureReason() == StudentEnrollmentClosureReason.SESSION_COMPLETED
-                                || e.getClosureReason() == StudentEnrollmentClosureReason.GRADUATED)
+                                || e.getClosureReason() == StudentEnrollmentClosureReason.GRADUATED
+                                || e.getClosureReason() == StudentEnrollmentClosureReason.TRANSFERRED
+                                || e.getClosureReason() == StudentEnrollmentClosureReason.WITHDRAWN)
                         .findFirst().orElse(history.getLast()));
     }
 
     private String appliedState(StudentEnrollment source, List<StudentEnrollment> targetHistory) {
         if (source.getStatus() != StudentEnrollmentStatus.CLOSED) return "NOT_APPLIED";
         if (source.getClosureReason() == StudentEnrollmentClosureReason.GRADUATED) return "ALREADY_APPLIED:PASS_OUT";
+        // Year-end (or earlier) exits: shown as recorded rather than as a conflict.
+        if (source.getClosureReason() == StudentEnrollmentClosureReason.TRANSFERRED) return "ALREADY_APPLIED:TRANSFER";
+        if (source.getClosureReason() == StudentEnrollmentClosureReason.WITHDRAWN) return "ALREADY_APPLIED:WITHDRAW";
         if (source.getClosureReason() != StudentEnrollmentClosureReason.SESSION_COMPLETED || targetHistory.size() != 1)
             return "CONFLICT";
         return Objects.equals(source.getClassId(), targetHistory.getFirst().getClassId())

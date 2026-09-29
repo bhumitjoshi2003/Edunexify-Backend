@@ -227,6 +227,7 @@ class StudentPromotionHttpContractPostgresIT {
     }
 
     private void cleanupFixture() {
+        jdbc.update("DELETE FROM student_rollover_run WHERE school_id=?", SCHOOL);
         jdbc.update("DELETE FROM student_enrollment WHERE school_id=?", SCHOOL);
         jdbc.update("DELETE FROM student WHERE school_id=?", SCHOOL);
         jdbc.update("DELETE FROM section WHERE school_id=?", SCHOOL);

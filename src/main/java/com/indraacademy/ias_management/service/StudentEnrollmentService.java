@@ -106,6 +106,46 @@ public class StudentEnrollmentService {
                 .toList();
     }
 
+    /**
+     * Year-end TRANSFER decisions recorded ahead of their source session's end (the
+     * enrollment closed at exactly the session end with that reason) that are now due and not yet
+     * finalized — the student is still ACTIVE and has no later enrollment. A normal exit is never
+     * returned: it changes the student's status at once.
+     */
+    @Transactional(readOnly = true)
+    public List<StudentEnrollment> findDueYearEndExitEnrollments(Long schoolId, LocalDate schoolLocalToday) {
+        if (schoolId == null || schoolLocalToday == null) {
+            throw new IllegalArgumentException("schoolId and schoolLocalToday are required");
+        }
+        List<StudentEnrollment> due = new java.util.ArrayList<>();
+        for (StudentEnrollmentClosureReason reason : List.of(StudentEnrollmentClosureReason.TRANSFERRED)) {
+            due.addAll(enrollmentRepository
+                    .findBySchoolIdAndStatusAndClosureReasonAndEffectiveUntilLessThanEqualOrderByStudentIdAscEffectiveUntilAsc(
+                            schoolId, StudentEnrollmentStatus.CLOSED, reason, schoolLocalToday));
+        }
+        if (due.isEmpty()) {
+            return due;
+        }
+        java.util.Map<String, Student> byStudentId = studentRepository
+                .findByStudentIdInAndSchoolId(due.stream().map(StudentEnrollment::getStudentId).distinct().toList(), schoolId)
+                .stream().collect(java.util.stream.Collectors.toMap(Student::getStudentId, s -> s, (a, b) -> a));
+        java.util.Map<Long, LocalDate> sessionEnds = new java.util.HashMap<>();
+        return due.stream()
+                .filter(e -> {
+                    Student s = byStudentId.get(e.getStudentId());
+                    return s != null && s.getStatus() == StudentStatus.ACTIVE;
+                })
+                .filter(e -> Objects.equals(e.getEffectiveUntil(), sessionEnds.computeIfAbsent(e.getAcademicSessionId(),
+                        id -> sessionRepository.findByIdAndSchoolId(id, schoolId)
+                                .map(AcademicSession::getEndDate).orElse(null))))
+                .filter(e -> enrollmentRepository.findBySchoolIdAndStudentIdOrderByAcademicSessionIdAscEffectiveFromAsc(
+                                schoolId, e.getStudentId()).stream()
+                        .noneMatch(o -> !Objects.equals(o.getId(), e.getId())
+                                && o.getStatus() != StudentEnrollmentStatus.CANCELLED
+                                && o.getEffectiveFrom().isAfter(e.getEffectiveUntil())))
+                .toList();
+    }
+
     @Transactional
     public StudentEnrollment createActiveEnrollment(
             Long schoolId, String studentId, Long sessionId,

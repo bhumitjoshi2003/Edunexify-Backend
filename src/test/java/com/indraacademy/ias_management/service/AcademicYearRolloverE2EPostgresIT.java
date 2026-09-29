@@ -1736,6 +1736,7 @@ class AcademicYearRolloverE2EPostgresIT {
         jdbc.update("DELETE FROM class_teacher_activation WHERE school_id=?", SCHOOL);
         jdbc.update("DELETE FROM class_teacher_responsibility WHERE school_id=?", SCHOOL);
         jdbc.update("DELETE FROM timetable_entry WHERE school_id=?", SCHOOL);
+        jdbc.update("DELETE FROM student_rollover_run WHERE school_id=?", SCHOOL);
         jdbc.update("DELETE FROM student_enrollment WHERE school_id=?", SCHOOL);
         jdbc.update("DELETE FROM student WHERE school_id=?", SCHOOL);
         jdbc.update("DELETE FROM teacher WHERE school_id=?", SCHOOL);
