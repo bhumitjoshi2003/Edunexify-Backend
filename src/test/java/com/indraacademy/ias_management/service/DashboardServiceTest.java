@@ -56,6 +56,7 @@ class DashboardServiceTest {
     @Mock private StudentAttendanceRepository studentAttendanceRepository;
     @Mock private SchoolClassRepository schoolClassRepository;
     @Mock private LeaveRepository leaveRepository;
+    @Mock private com.indraacademy.ias_management.repository.TeacherLeaveRepository teacherLeaveRepository;
     @Mock private SchoolRepository schoolRepository;
     @Mock private SecurityUtil securityUtil;
 
@@ -76,6 +77,7 @@ class DashboardServiceTest {
         ReflectionTestUtils.setField(service, "leaveRepository", leaveRepository);
         ReflectionTestUtils.setField(service, "schoolRepository", schoolRepository);
         ReflectionTestUtils.setField(service, "securityUtil", securityUtil);
+        ReflectionTestUtils.setField(service, "teacherLeaveRepository", teacherLeaveRepository);
 
         lenient().when(securityUtil.getSchoolId()).thenReturn(SCHOOL_ID);
         School school = new School();
@@ -87,6 +89,18 @@ class DashboardServiceTest {
         lenient().when(studentFeesRepository.countDistinctOverdueStudents(any(), any(), anyInt())).thenReturn(0L);
         lenient().when(studentAttendanceRepository.findSchoolRowsOnDate(any(), any())).thenReturn(List.of());
         lenient().when(leaveRepository.countByStatusAndSchoolId(LeaveStatus.PENDING, SCHOOL_ID)).thenReturn(0L);
+    }
+
+    @Test
+    void pendingLeaves_isStudentPlusTeacherPending_withABreakdown() {
+        when(leaveRepository.countByStatusAndSchoolId(LeaveStatus.PENDING, SCHOOL_ID)).thenReturn(4L);
+        when(teacherLeaveRepository.countByStatusAndSchoolId(LeaveStatus.PENDING, SCHOOL_ID)).thenReturn(2L);
+
+        DashboardStatsDto stats = service.getStats();
+
+        assertThat(stats.getPendingLeaves()).isEqualTo(6L);
+        assertThat(stats.getPendingStudentLeaves()).isEqualTo(4L);
+        assertThat(stats.getPendingTeacherLeaves()).isEqualTo(2L);
     }
 
     @Test

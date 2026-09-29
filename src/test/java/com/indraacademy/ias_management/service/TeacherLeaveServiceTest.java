@@ -117,7 +117,7 @@ class TeacherLeaveServiceTest {
         req.setEndDate(LocalDate.of(2026, 8, 22));
         req.setReason("Family event");
 
-        when(teacherRepository.findByTeacherIdAndSchoolId(TEACHER_ID, SCHOOL_ID)).thenReturn(Optional.of(teacher()));
+        when(teacherRepository.lockByTeacherIdAndSchoolId(TEACHER_ID, SCHOOL_ID)).thenReturn(Optional.of(teacher()));
         when(teacherLeaveRepository.save(any(TeacherLeave.class))).thenAnswer(inv -> {
             TeacherLeave saved = inv.getArgument(0);
             saved.setId(LEAVE_ID);
@@ -212,7 +212,7 @@ class TeacherLeaveServiceTest {
         req.setStartDate(LocalDate.of(2026, 8, 20));
         req.setEndDate(LocalDate.of(2026, 8, 23));
         req.setReason("Long leave");
-        when(teacherRepository.findByTeacherIdAndSchoolId(TEACHER_ID, SCHOOL_ID)).thenReturn(Optional.of(teacher()));
+        when(teacherRepository.lockByTeacherIdAndSchoolId(TEACHER_ID, SCHOOL_ID)).thenReturn(Optional.of(teacher()));
         when(teacherLeaveRepository.save(any(TeacherLeave.class))).thenAnswer(inv -> {
             TeacherLeave saved = inv.getArgument(0);
             saved.setId(LEAVE_ID);
@@ -255,13 +255,18 @@ class TeacherLeaveServiceTest {
 
     /** Reversal (APPROVED -> REJECTED) stays legal, mirroring student Leave's confirmed policy. */
     @Test
-    void updateStatus_approvedToRejected_stillSucceeds_theReversalCase() {
+    void updateStatus_approvedToRejected_isAnExplicitReversal_withReason() {
         when(teacherLeaveRepository.findByIdForUpdate(LEAVE_ID)).thenReturn(Optional.of(leave(LeaveStatus.APPROVED)));
+        assertThatThrownBy(() -> service.updateStatus(LEAVE_ID, LeaveStatus.REJECTED, request))
+                .isInstanceOf(InvalidLeaveStatusTransitionException.class);
+        assertThatThrownBy(() -> service.updateStatus(LEAVE_ID, LeaveStatus.PENDING, request))
+                .isInstanceOf(IllegalArgumentException.class);
         when(teacherLeaveRepository.save(any(TeacherLeave.class))).thenAnswer(inv -> inv.getArgument(0));
 
-        TeacherLeaveResponse updated = service.updateStatus(LEAVE_ID, LeaveStatus.REJECTED, request);
+        TeacherLeaveResponse updated = service.reverse(LEAVE_ID, "Exam duty clash", request);
 
         assertThat(updated.getStatus()).isEqualTo(LeaveStatus.REJECTED);
+        assertThat(updated.getDecisionReason()).isEqualTo("Exam duty clash");
         verify(businessNotifications).direct(eq(SCHOOL_ID), eq(TEACHER_ID),
                 eq(com.indraacademy.ias_management.notification.NotificationEventCode.LEAVE_REJECTED),
                 any(), anyString(), anyString(), anyString(), anyString(), eq(TeacherLeaveService.TEACHER_LEAVE_ROUTE),
@@ -307,7 +312,9 @@ class TeacherLeaveServiceTest {
 
         service.cancelLeave(LEAVE_ID, request);
 
-        verify(teacherLeaveRepository).deleteById(LEAVE_ID);
+        verify(teacherLeaveRepository, never()).deleteById(any());
+        verify(teacherLeaveRepository).save(argThat(l -> l.getStatus() == LeaveStatus.CANCELLED
+                && TEACHER_ID.equals(l.getCancelledBy()) && l.getCancelledAt() != null));
         verify(auditService).log(eq(TEACHER_ID), eq("TEACHER"), eq("CANCEL_TEACHER_LEAVE"), eq("TeacherLeave"), anyString(), anyString(), any(), anyString());
     }
 
@@ -334,14 +341,17 @@ class TeacherLeaveServiceTest {
     }
 
     @Test
-    void cancelLeave_adminCanCancelAnyStatus_unrestrictedPrecedent() {
+    void cancelLeave_adminCancelsApprovedLeave_onlyWithAReason_andKeepsHistory() {
         when(securityUtil.getRole()).thenReturn("ADMIN");
         when(securityUtil.getUsername()).thenReturn("admin1");
         when(teacherLeaveRepository.findByIdForUpdate(LEAVE_ID)).thenReturn(Optional.of(leave(LeaveStatus.APPROVED)));
 
-        service.cancelLeave(LEAVE_ID, request);
+        assertThatThrownBy(() -> service.cancelLeave(LEAVE_ID, request)).isInstanceOf(IllegalArgumentException.class);
+        service.cancelLeave(LEAVE_ID, "Teacher returned early", request);
 
-        verify(teacherLeaveRepository).deleteById(LEAVE_ID);
+        verify(teacherLeaveRepository, never()).deleteById(any());
+        verify(teacherLeaveRepository).save(argThat(l -> l.getStatus() == LeaveStatus.CANCELLED
+                && "Teacher returned early".equals(l.getCancellationReason()) && "admin1".equals(l.getCancelledBy())));
     }
 
     @Test

@@ -60,4 +60,23 @@ public class TeacherLeave {
     @CreationTimestamp
     @Column(name = "applied_date", nullable = false, updatable = false)
     private LocalDateTime appliedDate;
+
+    // ── Decision / cancellation history (Leave Phase 1) ───────────────────
+    @Column(name = "decided_by")
+    private String decidedBy;
+
+    @Column(name = "decided_at")
+    private LocalDateTime decidedAt;
+
+    @Column(name = "decision_reason", length = 500)
+    private String decisionReason;
+
+    @Column(name = "cancelled_by")
+    private String cancelledBy;
+
+    @Column(name = "cancelled_at")
+    private LocalDateTime cancelledAt;
+
+    @Column(name = "cancellation_reason", length = 500)
+    private String cancellationReason;
 }

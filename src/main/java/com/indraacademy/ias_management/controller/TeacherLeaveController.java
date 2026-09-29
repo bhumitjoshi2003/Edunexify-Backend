@@ -79,7 +79,7 @@ public class TeacherLeaveController {
             return ResponseEntity.badRequest().body(Map.of("message", "Invalid status value: " + statusValue));
         }
         try {
-            TeacherLeaveResponse updated = teacherLeaveService.updateStatus(leaveId, status, request);
+            TeacherLeaveResponse updated = teacherLeaveService.updateStatus(leaveId, status, body.get("reason"), request);
             return ResponseEntity.ok(updated);
         } catch (NoSuchElementException e) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("message", e.getMessage()));
@@ -90,11 +90,31 @@ public class TeacherLeaveController {
         }
     }
 
+    /** Admin reversal of a decision (APPROVED ↔ REJECTED) with a required reason. */
+    @PreAuthorize("hasRole('" + Role.ADMIN + "')")
+    @PostMapping("/{leaveId}/reverse")
+    public ResponseEntity<?> reverse(@PathVariable Long leaveId,
+                                     @RequestBody(required = false) Map<String, String> body,
+                                     HttpServletRequest request) {
+        try {
+            return ResponseEntity.ok(teacherLeaveService.reverse(leaveId, body == null ? null : body.get("reason"), request));
+        } catch (NoSuchElementException e) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("message", e.getMessage()));
+        } catch (SecurityException e) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of("message", e.getMessage()));
+        } catch (InvalidLeaveStatusTransitionException | IllegalStateException e) {
+            return ResponseEntity.status(HttpStatus.CONFLICT).body(Map.of("message", e.getMessage()));
+        }
+    }
+
+    /** Cancels (keeps the request as CANCELLED history). An approved leave needs a reason. */
     @PreAuthorize("hasAnyRole('" + Role.TEACHER + "', '" + Role.ADMIN + "')")
     @DeleteMapping("/{leaveId}")
-    public ResponseEntity<?> cancelLeave(@PathVariable Long leaveId, HttpServletRequest request) {
+    public ResponseEntity<?> cancelLeave(@PathVariable Long leaveId,
+                                         @RequestParam(required = false) String reason,
+                                         HttpServletRequest request) {
         try {
-            teacherLeaveService.cancelLeave(leaveId, request);
+            teacherLeaveService.cancelLeave(leaveId, reason, request);
             return ResponseEntity.ok(Map.of("message", "Leave request cancelled successfully."));
         } catch (NoSuchElementException e) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("message", e.getMessage()));

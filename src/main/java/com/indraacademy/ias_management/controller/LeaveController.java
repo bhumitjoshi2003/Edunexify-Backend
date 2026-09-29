@@ -43,10 +43,11 @@ public class LeaveController {
     @Autowired private SecurityUtil securityUtil;
     @Autowired private ParentPortalService parentPortalService;
     @Autowired private TeacherClassScopeService teacherClassScopeService;
+    @Autowired private com.indraacademy.ias_management.service.LeaveOverviewService leaveOverviewService;
 
     @PreAuthorize("hasAnyRole('" + Role.STUDENT + "', '" + Role.PARENT + "')")
     @PostMapping("/apply-leave")
-    public ResponseEntity<String> applyLeave(@Valid @RequestBody Leave leave,
+    public ResponseEntity<String> applyLeave(@Valid @RequestBody com.indraacademy.ias_management.dto.StudentLeaveApplyRequest leave,
                                              @RequestParam(required = false) String studentId,
                                              HttpServletRequest request) {
         String role = authService.getRole();
@@ -58,17 +59,20 @@ public class LeaveController {
             parentPortalService.assertChildAccess(effectiveStudentId, ParentPortalService.ChildPermission.MANAGE_LEAVE);
         }
         log.info("Request to apply leave for student ID: {}", effectiveStudentId);
-        leave.setStudentId(effectiveStudentId);
-        leaveService.applyLeave(leave, request);
+        // Only the date and reason are read from the body; the student is the caller (STUDENT)
+        // or an authorised linked child (PARENT), never a body field.
+        leaveService.applyLeave(effectiveStudentId, leave, request);
         return ResponseEntity.ok("Leave applied successfully");
     }
 
     @PreAuthorize("hasAnyRole('" + Role.STUDENT + "', '" + Role.PARENT + "', '" + Role.ADMIN + "')")
     @DeleteMapping("/delete/{studentId}/{leaveDate}")
-    public ResponseEntity<String> deleteLeave(@PathVariable String studentId, @PathVariable String leaveDate, HttpServletRequest request) {
+    public ResponseEntity<String> deleteLeave(@PathVariable String studentId, @PathVariable String leaveDate,
+                                              @RequestParam(required = false) String reason, HttpServletRequest request) {
+        // Cancels the request (kept as CANCELLED history) — never deletes it.
         String userId = authService.getUserId();
         String role = authService.getRole();
-        log.warn("Request to delete leave for {} on {} by user {} ({})", studentId, leaveDate, userId, role);
+        log.info("Request to cancel leave for {} on {} by user {} ({})", studentId, leaveDate, userId, role);
 
         String finalStudentId = studentId;
         if(Role.STUDENT.equals(role)) {
@@ -77,9 +81,8 @@ public class LeaveController {
             parentPortalService.assertChildAccess(finalStudentId, ParentPortalService.ChildPermission.MANAGE_LEAVE);
         }
 
-        leaveService.deleteLeave(finalStudentId, leaveDate, request);
-        log.info("Leave deleted successfully for student {} on {}", finalStudentId, leaveDate);
-        return new ResponseEntity<>("Leave deleted successfully", HttpStatus.OK);
+        leaveService.cancelForStudentDate(finalStudentId, leaveDate, reason, request);
+        return new ResponseEntity<>("Leave cancelled", HttpStatus.OK);
     }
 
     @GetMapping("/student")
@@ -161,6 +164,7 @@ public class LeaveController {
             HttpServletRequest request) {
         log.info("Request to update status of leave ID: {}", leaveId);
         String statusValue = body.get("status");
+        String reason = body.get("reason");
         if (statusValue == null) {
             return ResponseEntity.badRequest().body("Missing 'status' field.");
         }
@@ -171,7 +175,7 @@ public class LeaveController {
             return ResponseEntity.badRequest().body("Invalid status value: " + statusValue);
         }
         try {
-            Leave updated = leaveService.updateLeaveStatus(leaveId, status, request);
+            Leave updated = leaveService.decide(leaveId, status, reason, request);
             return ResponseEntity.ok(updated);
         } catch (SecurityException e) {
             return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of("message", e.getMessage()));
@@ -245,16 +249,39 @@ public class LeaveController {
         return ResponseEntity.ok(result);
     }
 
+    /** Explicit reversal of a decision (APPROVED ↔ REJECTED) with a required reason. */
+    @PreAuthorize("hasAnyRole('" + Role.ADMIN + "', '" + Role.TEACHER + "')")
+    @PostMapping("/{leaveId}/reverse")
+    public ResponseEntity<?> reverseLeaveDecision(@PathVariable Long leaveId,
+                                                  @RequestBody(required = false) Map<String, String> body,
+                                                  HttpServletRequest request) {
+        try {
+            return ResponseEntity.ok(leaveService.reverse(leaveId, body == null ? null : body.get("reason"), request));
+        } catch (SecurityException e) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of("message", e.getMessage()));
+        } catch (InvalidLeaveStatusTransitionException e) {
+            return ResponseEntity.status(HttpStatus.CONFLICT).body(Map.of("message", e.getMessage()));
+        }
+    }
+
+    /** Admin cancel (the request stays as CANCELLED history). Approved leave needs a reason. */
     @PreAuthorize("hasAnyRole('" + Role.ADMIN + "')")
     @DeleteMapping("/{leaveId}")
-    public ResponseEntity<String> deleteLeaveById(@PathVariable Long leaveId, HttpServletRequest request) {
-        log.warn("Request to delete leave by ID: {}", leaveId);
+    public ResponseEntity<String> deleteLeaveById(@PathVariable Long leaveId,
+                                                  @RequestParam(required = false) String reason,
+                                                  HttpServletRequest request) {
         try {
-            leaveService.deleteLeaveById(leaveId, request);
+            leaveService.cancelById(leaveId, reason, request);
         } catch (SecurityException e) {
             return ResponseEntity.status(HttpStatus.FORBIDDEN).body(e.getMessage());
         }
-        log.info("Leave application deleted successfully by ID: {}", leaveId);
-        return new ResponseEntity<>("Leave application deleted successfully", HttpStatus.OK);
+        return new ResponseEntity<>("Leave application cancelled", HttpStatus.OK);
+    }
+
+    /** Admin: students and staff on approved leave today, and periods still needing a substitute. */
+    @PreAuthorize("hasRole('" + Role.ADMIN + "')")
+    @GetMapping("/on-leave-today")
+    public ResponseEntity<com.indraacademy.ias_management.service.LeaveOverviewService.OnLeaveToday> onLeaveToday() {
+        return ResponseEntity.ok(leaveOverviewService.onLeaveToday());
     }
 }

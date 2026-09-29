@@ -91,6 +91,8 @@ class LeaveConcurrencyIT {
     @Autowired private PlatformTransactionManager transactionManager;
 
     @MockBean private NotificationService notificationService;
+    @MockBean private BusinessNotificationService businessNotificationService;
+    @MockBean private TeacherClassScopeService teacherClassScopeService;
     @MockBean private AuditService auditService;
     @MockBean private SecurityUtil securityUtil;
 

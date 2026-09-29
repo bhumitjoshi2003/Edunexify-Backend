@@ -40,6 +40,7 @@ public class DashboardService {
     @Autowired private StudentAttendanceRepository studentAttendanceRepository;
     @Autowired private SchoolClassRepository schoolClassRepository;
     @Autowired private LeaveRepository leaveRepository;
+    @Autowired private com.indraacademy.ias_management.repository.TeacherLeaveRepository teacherLeaveRepository;
     @Autowired private SchoolRepository schoolRepository;
     @Autowired private SecurityUtil securityUtil;
 
@@ -77,7 +78,10 @@ public class DashboardService {
         double todayAttendanceRate = rate(studentAttendanceRepository.findSchoolRowsOnDate(schoolId, today));
 
         // Pending leaves: leave applications with PENDING status
-        long pendingLeaves = leaveRepository.countByStatusAndSchoolId(LeaveStatus.PENDING, schoolId);
+        long pendingStudentLeaves = leaveRepository.countByStatusAndSchoolId(LeaveStatus.PENDING, schoolId);
+        long pendingTeacherLeaves = teacherLeaveRepository.countByStatusAndSchoolId(LeaveStatus.PENDING, schoolId);
+        // Two separate tables, so nothing is counted twice.
+        long pendingLeaves = pendingStudentLeaves + pendingTeacherLeaves;
 
         DashboardStatsDto dto = new DashboardStatsDto();
         dto.setTotalStudents(totalStudents);
@@ -86,6 +90,8 @@ public class DashboardService {
         dto.setOverdueStudents(overdueStudents);
         dto.setTodayAttendanceRate(todayAttendanceRate);
         dto.setPendingLeaves(pendingLeaves);
+        dto.setPendingStudentLeaves(pendingStudentLeaves);
+        dto.setPendingTeacherLeaves(pendingTeacherLeaves);
 
         log.info("Dashboard stats computed: students={}, teachers={}, fees={}, overdue={}, attendance={}%, leaves={}",
                 totalStudents, totalTeachers, feesCollectedThisMonth,

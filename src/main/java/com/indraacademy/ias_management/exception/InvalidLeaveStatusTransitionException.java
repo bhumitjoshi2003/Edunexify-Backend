@@ -34,6 +34,15 @@ public class InvalidLeaveStatusTransitionException extends RuntimeException {
         this.attemptedStatus  = attemptedStatus;
     }
 
+    /** Same conflict, with a specific explanation (e.g. "already decided — use reversal"). */
+    public InvalidLeaveStatusTransitionException(Long leaveId, LeaveStatus currentStatus, LeaveStatus attemptedStatus,
+                                                 String message) {
+        super(message);
+        this.leaveId          = leaveId;
+        this.currentStatus    = currentStatus;
+        this.attemptedStatus  = attemptedStatus;
+    }
+
     public Long getLeaveId()               { return leaveId; }
     public LeaveStatus getCurrentStatus()   { return currentStatus; }
     public LeaveStatus getAttemptedStatus() { return attemptedStatus; }

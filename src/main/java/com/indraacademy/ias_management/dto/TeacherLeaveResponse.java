@@ -21,6 +21,12 @@ public class TeacherLeaveResponse {
     private LocalDateTime appliedDate;
     /** Working leave days only (configured weekdays minus school holidays). */
     private long days;
+    private String decidedBy;
+    private LocalDateTime decidedAt;
+    private String decisionReason;
+    private String cancelledBy;
+    private LocalDateTime cancelledAt;
+    private String cancellationReason;
 
     public static TeacherLeaveResponse from(TeacherLeave l) {
         TeacherLeaveResponse r = new TeacherLeaveResponse();
@@ -33,6 +39,12 @@ public class TeacherLeaveResponse {
         r.status = l.getStatus();
         r.appliedDate = l.getAppliedDate();
         r.days = java.time.temporal.ChronoUnit.DAYS.between(l.getStartDate(), l.getEndDate()) + 1;
+        r.decidedBy = l.getDecidedBy();
+        r.decidedAt = l.getDecidedAt();
+        r.decisionReason = l.getDecisionReason();
+        r.cancelledBy = l.getCancelledBy();
+        r.cancelledAt = l.getCancelledAt();
+        r.cancellationReason = l.getCancellationReason();
         return r;
     }
 
@@ -43,6 +55,12 @@ public class TeacherLeaveResponse {
     }
 
     public Long getId() { return id; }
+    public String getDecidedBy() { return decidedBy; }
+    public LocalDateTime getDecidedAt() { return decidedAt; }
+    public String getDecisionReason() { return decisionReason; }
+    public String getCancelledBy() { return cancelledBy; }
+    public LocalDateTime getCancelledAt() { return cancelledAt; }
+    public String getCancellationReason() { return cancellationReason; }
     public String getTeacherId() { return teacherId; }
     public String getTeacherName() { return teacherName; }
     public LocalDate getStartDate() { return startDate; }

@@ -25,6 +25,17 @@ public interface TeacherLeaveRepository extends JpaRepository<TeacherLeave, Long
     @Query("select t from TeacherLeave t where t.id = :id")
     Optional<TeacherLeave> findByIdForUpdate(@Param("id") Long id);
 
+    /** PENDING or APPROVED requests of one teacher overlapping a date range (optionally excluding one). */
+    @Query("SELECT COUNT(t) > 0 FROM TeacherLeave t WHERE t.schoolId = :schoolId AND t.teacherId = :teacherId " +
+           "AND t.status IN (com.indraacademy.ias_management.entity.LeaveStatus.PENDING, " +
+           "com.indraacademy.ias_management.entity.LeaveStatus.APPROVED) " +
+           "AND t.startDate <= :rangeEnd AND t.endDate >= :rangeStart AND (:excludeId IS NULL OR t.id <> :excludeId)")
+    boolean existsActiveOverlapping(@Param("schoolId") Long schoolId, @Param("teacherId") String teacherId,
+                                    @Param("rangeStart") LocalDate rangeStart, @Param("rangeEnd") LocalDate rangeEnd,
+                                    @Param("excludeId") Long excludeId);
+
+    long countByStatusAndSchoolId(LeaveStatus status, Long schoolId);
+
     Page<TeacherLeave> findByTeacherIdAndSchoolIdOrderByStartDateDesc(String teacherId, Long schoolId, Pageable pageable);
 
     /**

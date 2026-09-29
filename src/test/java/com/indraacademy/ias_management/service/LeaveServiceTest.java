@@ -66,7 +66,7 @@ class LeaveServiceTest {
         ReflectionTestUtils.setField(service, "businessNotifications", businessNotifications);
         ReflectionTestUtils.setField(service, "auditService", auditService);
         ReflectionTestUtils.setField(service, "securityUtil", securityUtil);
-        ReflectionTestUtils.setField(service, "objectMapper", new ObjectMapper());
+        ReflectionTestUtils.setField(service, "objectMapper", new ObjectMapper().findAndRegisterModules());
 
         TeacherClassScopeService scopeService = new TeacherClassScopeService();
         ReflectionTestUtils.setField(scopeService, "teacherRepository", teacherRepository);
@@ -142,21 +142,26 @@ class LeaveServiceTest {
 
     /** The existing product feature (ViewLeavesComponent.editLeaveStatus) — must keep working. */
     @Test
-    void approvedToRejected_stillSucceeds_theExistingReversalFeature() {
+    void approvedToRejected_isAnExplicitReversal_notASecondDecision() {
         when(leaveRepository.findByIdForUpdate(LEAVE_ID)).thenReturn(Optional.of(leave(LeaveStatus.APPROVED)));
+        assertThatThrownBy(() -> service.updateLeaveStatus(LEAVE_ID, LeaveStatus.REJECTED, request))
+                .isInstanceOf(InvalidLeaveStatusTransitionException.class).hasMessageContaining("Change decision");
         when(leaveRepository.save(any(Leave.class))).thenAnswer(inv -> inv.getArgument(0));
 
-        Leave updated = service.updateLeaveStatus(LEAVE_ID, LeaveStatus.REJECTED, request);
+        Leave updated = service.reverse(LEAVE_ID, "Medical note was not genuine", request);
 
         assertThat(updated.getStatus()).isEqualTo(LeaveStatus.REJECTED);
+        assertThat(updated.getDecisionReason()).isEqualTo("Medical note was not genuine");
+        assertThat(updated.getDecidedBy()).isEqualTo("tester");
     }
 
     @Test
-    void rejectedToApproved_stillSucceeds_theExistingReversalFeature() {
+    void rejectedToApproved_isAnExplicitReversal_withARequiredReason() {
         when(leaveRepository.findByIdForUpdate(LEAVE_ID)).thenReturn(Optional.of(leave(LeaveStatus.REJECTED)));
+        assertThatThrownBy(() -> service.reverse(LEAVE_ID, " ", request)).isInstanceOf(IllegalArgumentException.class);
         when(leaveRepository.save(any(Leave.class))).thenAnswer(inv -> inv.getArgument(0));
 
-        Leave updated = service.updateLeaveStatus(LEAVE_ID, LeaveStatus.APPROVED, request);
+        Leave updated = service.reverse(LEAVE_ID, "Parent brought the certificate", request);
 
         assertThat(updated.getStatus()).isEqualTo(LeaveStatus.APPROVED);
     }

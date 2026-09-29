@@ -17,6 +17,12 @@ public interface TeacherRepository extends JpaRepository<Teacher, String> {
 
     Optional<Teacher> findByTeacherIdAndSchoolId(String teacherId, Long schoolId);
 
+    /** Row-locked teacher read — serializes a teacher's concurrent leave applications (overlap check). */
+    @org.springframework.data.jpa.repository.Lock(jakarta.persistence.LockModeType.PESSIMISTIC_WRITE)
+    @org.springframework.data.jpa.repository.Query("select t from Teacher t where t.teacherId = :teacherId and t.schoolId = :schoolId")
+    Optional<Teacher> lockByTeacherIdAndSchoolId(@org.springframework.data.repository.query.Param("teacherId") String teacherId,
+                                                 @org.springframework.data.repository.query.Param("schoolId") Long schoolId);
+
     /** A class can legitimately have more than one class-teacher once it has sections (one per
      *  section) — callers that need "the" class teacher for a specific student/section must use
      *  {@link #findByClassTeacherAndClassTeacherSectionIdAndSchoolId} or filter this list

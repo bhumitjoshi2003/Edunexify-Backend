@@ -7,6 +7,9 @@ public class DashboardStatsDto {
     private long overdueStudents;
     private double todayAttendanceRate;
     private long pendingLeaves;
+    /** Breakdown of pendingLeaves (student + teacher leave). */
+    private long pendingStudentLeaves;
+    private long pendingTeacherLeaves;
 
     public long getTotalStudents() { return totalStudents; }
     public void setTotalStudents(long totalStudents) { this.totalStudents = totalStudents; }
@@ -25,4 +28,8 @@ public class DashboardStatsDto {
 
     public long getPendingLeaves() { return pendingLeaves; }
     public void setPendingLeaves(long pendingLeaves) { this.pendingLeaves = pendingLeaves; }
+    public long getPendingStudentLeaves() { return pendingStudentLeaves; }
+    public void setPendingStudentLeaves(long v) { this.pendingStudentLeaves = v; }
+    public long getPendingTeacherLeaves() { return pendingTeacherLeaves; }
+    public void setPendingTeacherLeaves(long v) { this.pendingTeacherLeaves = v; }
 }

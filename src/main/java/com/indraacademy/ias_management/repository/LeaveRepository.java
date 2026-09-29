@@ -17,7 +17,6 @@ import java.util.Optional;
 @Repository
 public interface LeaveRepository extends JpaRepository<Leave, Long> {
 
-    void deleteByStudentIdAndLeaveDateAndSchoolId(String studentId, String leaveDate, Long schoolId);
 
     @org.springframework.transaction.annotation.Transactional
     void deleteByStudentIdAndSchoolId(String studentId, Long schoolId);
@@ -58,13 +57,20 @@ public interface LeaveRepository extends JpaRepository<Leave, Long> {
                                           @Param("sectionId") Long sectionId,
                                           Pageable pageable);
 
+    /** Students with APPROVED leave on a date in a class — Attendance V2: only approved leave counts. */
     @Query("SELECT l.studentId FROM Leave l WHERE l.leaveDate = :date AND l.className = :className AND l.schoolId = :schoolId " +
+           "AND l.status = com.indraacademy.ias_management.entity.LeaveStatus.APPROVED " +
            "AND (:sectionId IS NULL OR EXISTS (SELECT 1 FROM Student s WHERE s.studentId = l.studentId " +
            "     AND s.schoolId = l.schoolId AND s.sectionId = :sectionId))")
-    List<String> findByLeaveDateAndClassNameAndSchoolId(@Param("date") String date, @Param("className") String className,
+    List<String> findApprovedByLeaveDateAndClassNameAndSchoolId(@Param("date") String date, @Param("className") String className,
                                                           @Param("schoolId") Long schoolId, @Param("sectionId") Long sectionId);
 
-    Leave findByStudentIdAndLeaveDateAndSchoolId(String studentId, String leaveDate, Long schoolId);
+    /** Requests of one student on one day in the given statuses (exact student ID). */
+    List<Leave> findByStudentIdAndLeaveDateAndSchoolIdAndStatusIn(String studentId, String leaveDate, Long schoolId,
+                                                                  java.util.Collection<LeaveStatus> statuses);
+
+    /** Leave of one status on one day across the school ("On leave today"). */
+    List<Leave> findBySchoolIdAndLeaveDateAndStatusOrderByClassNameAscStudentNameAsc(Long schoolId, String leaveDate, LeaveStatus status);
 
     long countBySchoolIdAndAppliedDateBetween(Long schoolId, java.time.LocalDateTime start, java.time.LocalDateTime end);
 

@@ -47,6 +47,25 @@ public class Leave {
     @Column(nullable = false, columnDefinition = "VARCHAR(20)")
     private LeaveStatus status = LeaveStatus.PENDING;
 
+    // ── Decision / cancellation history (Leave Phase 1) ───────────────────
+    @Column(name = "decided_by")
+    private String decidedBy;
+
+    @Column(name = "decided_at")
+    private LocalDateTime decidedAt;
+
+    @Column(name = "decision_reason", length = 500)
+    private String decisionReason;
+
+    @Column(name = "cancelled_by")
+    private String cancelledBy;
+
+    @Column(name = "cancelled_at")
+    private LocalDateTime cancelledAt;
+
+    @Column(name = "cancellation_reason", length = 500)
+    private String cancellationReason;
+
     public Leave(){}
 
     public Leave(String studentId, String studentName, String leaveDate, String reason, String className) {
