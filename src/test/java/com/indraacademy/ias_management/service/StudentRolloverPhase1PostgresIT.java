@@ -89,6 +89,7 @@ class StudentRolloverPhase1PostgresIT {
     @MockBean SecurityUtil security;
     @MockBean AuditService auditService;
     @MockBean ParentPortalService parentPortal;
+    @MockBean StudentLoginService studentLoginService;
     @MockBean StudentFeesService studentFeesService;
     @MockBean UserDetailsServiceImpl userDetailsService;
     @MockBean EntitlementService entitlementService;
@@ -261,6 +262,7 @@ class StudentRolloverPhase1PostgresIT {
             scheduler.updateStudentStatuses();
             assertThat(status(T1)).isEqualTo("ACTIVE");
             verify(parentPortal, never()).endRelationshipsForExitedStudent(eq(SCHOOL), eq(T1), any());
+            verify(studentLoginService, never()).deactivate(SCHOOL, T1);   // login kept until effective
 
             clock.now = Instant.parse("2027-03-31T06:00:00Z");     // the effective date
             scheduler.updateStudentStatuses();
@@ -272,6 +274,8 @@ class StudentRolloverPhase1PostgresIT {
             assertThat(jdbc.queryForObject("SELECT reason_for_leaving FROM student WHERE student_id=?", String.class, W1)).isEqualTo("Transferred at year end");
             verify(parentPortal).endRelationshipsForExitedStudent(SCHOOL, T1, LocalDate.of(2027, 3, 31));
             verify(parentPortal).endRelationshipsForExitedStudent(SCHOOL, W1, LocalDate.of(2027, 3, 31));
+            verify(studentLoginService).deactivate(SCHOOL, T1);            // transfer effective: login revoked
+            verify(studentLoginService).deactivate(SCHOOL, W1);
             assertThat(count("SELECT count(*) FROM student_enrollment WHERE student_id=?", T1)).isOne();
 
             // Running again is a no-op; re-submitting the decision reports it as already applied.
@@ -295,6 +299,7 @@ class StudentRolloverPhase1PostgresIT {
             assertThat(enrollment(T1, SOURCE)).containsEntry("closure_reason", "TRANSFERRED")
                     .containsEntry("effective_until", java.sql.Date.valueOf("2027-03-31"));
             verify(parentPortal).endRelationshipsForExitedStudent(SCHOOL, T1, LocalDate.of(2027, 3, 31));
+            verify(studentLoginService).deactivate(SCHOOL, T1);
             assertThat(result.run().transferred()).isOne();
             assertThat(result.run().pending()).isZero();
         } finally {

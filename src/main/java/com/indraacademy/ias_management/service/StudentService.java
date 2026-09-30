@@ -19,6 +19,10 @@ import com.indraacademy.ias_management.repository.SectionRepository;
 import com.indraacademy.ias_management.repository.StudentRepository;
 import com.indraacademy.ias_management.repository.UserRepository;
 import com.indraacademy.ias_management.repository.AcademicSessionRepository;
+import com.indraacademy.ias_management.repository.StudentMarkRepository;
+import com.indraacademy.ias_management.dto.StudentAdmissionDtos;
+import com.indraacademy.ias_management.entity.StudentEnrollmentClosureReason;
+import com.indraacademy.ias_management.entity.StudentEnrollmentStatus;
 import com.indraacademy.ias_management.util.SecurityUtil;
 import com.indraacademy.ias_management.util.SchoolTimeUtil;
 import jakarta.servlet.http.HttpServletRequest;
@@ -43,6 +47,10 @@ public class StudentService {
 
     private static final Logger log = LoggerFactory.getLogger(StudentService.class);
 
+    /** "Left" list: students who left, plus cancelled admissions (they never joined but must stay findable). */
+    private static final List<StudentStatus> LEFT_STATUSES =
+            List.of(StudentStatus.TRANSFERRED, StudentStatus.WITHDRAWN, StudentStatus.ADMISSION_CANCELLED);
+
     @Autowired private StudentRepository studentRepository;
     @Autowired private StudentFeesService studentFeesService;
     @Autowired private SchoolRepository schoolRepository;
@@ -64,6 +72,8 @@ public class StudentService {
     @Autowired private StudentEnrollmentService studentEnrollmentService;
     @Autowired private StudentEnrollmentRepository studentEnrollmentRepository;
     @Autowired private Clock clock;
+    @Autowired private StudentLoginService studentLoginService;
+    @Autowired private StudentMarkRepository studentMarkRepository;
 
     private LocalDate schoolToday(Long schoolId) {
         var school = schoolRepository.findById(schoolId)
@@ -140,6 +150,37 @@ public class StudentService {
         return studentRepository.searchByNameOrIdAndSchoolId(query.trim(), schoolId);
     }
 
+    /** Admission from the admin form: only the admin-editable fields are read. */
+    @Transactional
+    public Student addStudent(StudentAdmissionDtos.AdmissionRequest admission, HttpServletRequest request) {
+        if (admission == null) {
+            throw new IllegalArgumentException("Student object must be provided.");
+        }
+        Student student = new Student();
+        student.setName(trimToNull(admission.name()));
+        student.setEmail(trimToNull(admission.email()));
+        student.setPhoneNumber(trimToNull(admission.phoneNumber()));
+        student.setDob(admission.dob());
+        student.setClassName(admission.className());
+        student.setSectionId(admission.sectionId());
+        student.setGender(trimToNull(admission.gender()));
+        student.setFatherName(trimToNull(admission.fatherName()));
+        student.setMotherName(trimToNull(admission.motherName()));
+        student.setTakesBus(Boolean.TRUE.equals(admission.takesBus()));
+        student.setDistance(admission.distance());
+        student.setJoiningDate(admission.joiningDate());
+        return addStudent(student, request);
+    }
+
+    private static String trimToNull(String value) {
+        return value == null || value.isBlank() ? null : value.trim();
+    }
+
+    /**
+     * Canonical admission: student, enrollment and login are created in one transaction, so a
+     * failure at any step leaves nothing behind. Lifecycle-controlled fields on the incoming
+     * object are always reset here.
+     */
     @Transactional
     public Student addStudent(Student student, HttpServletRequest request) {
         if (student == null) {
@@ -159,6 +200,11 @@ public class StudentService {
             student.setStudentId(idGeneratorService.generateStudentId());
         }
         log.info("Attempting to add new student with ID: {}", student.getStudentId());
+        student.setLeavingDate(null);
+        student.setReasonForLeaving(null);
+        student.setConductAtLeaving(null);
+        student.setExitRemarks(null);
+        student.setPhotoUrl(null);
 
         Long schoolId = securityUtil.getSchoolId();
         try {
@@ -200,6 +246,11 @@ public class StudentService {
             student.setClassId(schoolClass.getId());
             resolveAndValidateSection(schoolId, schoolClass, student);
             AcademicSession session = requireSessionContaining(schoolId, student.getJoiningDate());
+            if (session.getEndDate() != null && session.getEndDate().isBefore(today)) {
+                throw new IllegalArgumentException("The joining date " + student.getJoiningDate()
+                        + " belongs to a past academic session (" + session.getLabel() + "). Historical admissions "
+                        + "can't be created through the admission form — use a joining date in the current or a future session.");
+            }
             Student savedStudent = studentRepository.saveAndFlush(student);
             if (student.getStatus() == StudentStatus.UPCOMING) {
                 // The Student columns remain populated for current UI/authorization compatibility,
@@ -212,6 +263,10 @@ public class StudentService {
                         schoolId, savedStudent.getStudentId(), session.getId(), schoolClass.getId(),
                         savedStudent.getSectionId(), savedStudent.getJoiningDate());
             }
+
+            // The login is part of the admission: if it can't be created, the whole admission
+            // rolls back instead of leaving a student without an account.
+            studentLoginService.create(savedStudent);
 
             auditService.log(
                     securityUtil.getUsername(),
@@ -310,13 +365,13 @@ public class StudentService {
     @Transactional(readOnly = true)
     public List<Student> getLeftStudentsByClass(String className) {
         return studentRepository.findByClassNameAndStatusInAndSchoolId(
-                className, List.of(StudentStatus.TRANSFERRED, StudentStatus.WITHDRAWN), securityUtil.getSchoolId());
+                className, LEFT_STATUSES, securityUtil.getSchoolId());
     }
 
     @Transactional(readOnly = true)
     public List<Student> getLeftStudentsByClassAndSection(String className, Long sectionId) {
         return studentRepository.findByClassNameAndSectionIdAndStatusInAndSchoolId(
-                className, sectionId, List.of(StudentStatus.TRANSFERRED, StudentStatus.WITHDRAWN), securityUtil.getSchoolId());
+                className, sectionId, LEFT_STATUSES, securityUtil.getSchoolId());
     }
 
     // ── Exit Workflow ──────────────────────────────────────────────────
@@ -330,7 +385,8 @@ public class StudentService {
         } catch (IllegalArgumentException e) {
             throw new IllegalArgumentException("Invalid exit type: " + request.getExitType() + ". Valid: GRADUATED, TRANSFERRED, WITHDRAWN");
         }
-        if (!exitStatus.isExitStatus() || exitStatus == StudentStatus.INACTIVE) {
+        if (exitStatus != StudentStatus.GRADUATED && exitStatus != StudentStatus.TRANSFERRED
+                && exitStatus != StudentStatus.WITHDRAWN) {
             throw new IllegalArgumentException("Invalid exit type: " + request.getExitType() + ". Valid: GRADUATED, TRANSFERRED, WITHDRAWN");
         }
 
@@ -354,6 +410,11 @@ public class StudentService {
         Student saved = studentRepository.save(student);
         parentPortalService.endRelationshipsForExitedStudent(
                 schoolId, studentId, request.getLeavingDate());
+        // A graduate keeps their login (past results and report cards); a student who
+        // transferred or withdrew loses login access now — the exit date is never in the future.
+        if (exitStatus != StudentStatus.GRADUATED) {
+            studentLoginService.deactivate(schoolId, studentId);
+        }
         auditService.log(
                 securityUtil.getUsername(), securityUtil.getRole(),
                 "EXIT_STUDENT", "Student", studentId,
@@ -392,15 +453,55 @@ public class StudentService {
 
     @Transactional
     public Student readmitStudent(String studentId, HttpServletRequest httpRequest) {
+        return readmitStudent(studentId, null, httpRequest);
+    }
+
+    /**
+     * Readmits an exited student into a chosen class/section from a chosen date (default today).
+     * The same Student record is reused and a new enrollment is created; closed history is never
+     * altered. Previously ended parent links are NOT restored here — the admin decides that
+     * separately (see {@link #restorableParentLinks}).
+     */
+    @Transactional
+    public Student readmitStudent(String studentId, StudentAdmissionDtos.ReadmitRequest choice,
+                                  HttpServletRequest httpRequest) {
         Long schoolId = securityUtil.getSchoolId();
-        LocalDate readmissionDate = schoolToday(schoolId);
-        Optional<AcademicSession> session = findSessionContaining(schoolId, readmissionDate);
+        LocalDate today = schoolToday(schoolId);
+        LocalDate readmissionDate = choice != null && choice.readmissionDate() != null ? choice.readmissionDate() : today;
+        if (readmissionDate.isAfter(today)) {
+            throw new IllegalArgumentException("The readmission date cannot be in the future.");
+        }
         Student studentSnapshot = studentRepository.findByStudentIdAndSchoolId(studentId, schoolId)
                 .orElseThrow(() -> new NoSuchElementException("Student not found: " + studentId));
+        if (studentSnapshot.getLeavingDate() != null && !readmissionDate.isAfter(studentSnapshot.getLeavingDate())) {
+            throw new IllegalArgumentException("The readmission date must be after the leaving date ("
+                    + studentSnapshot.getLeavingDate() + ").");
+        }
+        Optional<AcademicSession> session = findSessionContaining(schoolId, readmissionDate);
+        if (session.isPresent() && session.get().getEndDate().isBefore(today)) {
+            throw new IllegalArgumentException("The readmission date belongs to a past academic session ("
+                    + session.get().getLabel() + "). Choose a date in the current session.");
+        }
+        Long classId = studentSnapshot.getClassId();
+        Long sectionId = studentSnapshot.getSectionId();
+        if (choice != null && choice.classId() != null) {
+            classId = choice.classId();
+            sectionId = choice.sectionId();
+        }
         StudentEnrollmentService.LifecycleMutation lifecycle = studentEnrollmentService.createForExplicitReadmission(
                 schoolId, studentId, session.map(AcademicSession::getId).orElse(null),
-                studentSnapshot.getClassId(), studentSnapshot.getSectionId(), readmissionDate);
+                classId, sectionId, readmissionDate);
         Student student = lifecycle.student();
+        if (lifecycle.legacyUncovered() && choice != null && choice.classId() != null) {
+            // No enrollment history (pre-enrollment data): keep the projection in step with the choice.
+            SchoolClass schoolClass = schoolClassRepository.findByIdAndSchoolId(classId, schoolId)
+                    .orElseThrow(() -> new IllegalArgumentException("Class not found for this school."));
+            student.setClassId(schoolClass.getId());
+            student.setClassName(schoolClass.getName());
+            student.setSectionId(sectionId);
+            student.setSectionName(null);
+            resolveAndValidateSection(schoolId, schoolClass, student);
+        }
 
         String oldStatus = student.getStatus().name();
         student.setStatus(StudentStatus.ACTIVE);
@@ -410,12 +511,170 @@ public class StudentService {
         student.setLeavingDate(null);
 
         Student saved = studentRepository.save(student);
+        studentLoginService.reactivate(schoolId, studentId);
         auditService.log(
                 securityUtil.getUsername(), securityUtil.getRole(),
                 "READMIT_STUDENT", "Student", studentId,
-                oldStatus, "ACTIVE", httpRequest.getRemoteAddr());
-        log.info("Student {} re-admitted (was {})", studentId, oldStatus);
+                oldStatus, "ACTIVE classId=" + saved.getClassId() + ",sectionId=" + saved.getSectionId()
+                        + ",from=" + readmissionDate, httpRequest.getRemoteAddr());
+        log.info("Student {} re-admitted (was {}) from {}", studentId, oldStatus, readmissionDate);
         return saved;
+    }
+
+    // ── Cancel admission / login / history ─────────────────────────────
+
+    /**
+     * Cancels an UPCOMING student's admission before it starts. The PLANNED enrollment is kept
+     * as CANCELLED_BEFORE_START (never deleted), the student becomes ADMISSION_CANCELLED so the
+     * scheduler can never activate them, any login is deactivated and parent links are ended.
+     */
+    @Transactional
+    public Student cancelAdmission(String studentId, String reason, HttpServletRequest httpRequest) {
+        Long schoolId = securityUtil.getSchoolId();
+        LocalDate today = schoolToday(schoolId);
+        studentEnrollmentService.cancelPlannedAdmission(schoolId, studentId);
+        Student student = studentRepository.findByStudentIdAndSchoolId(studentId, schoolId)
+                .orElseThrow(() -> new NoSuchElementException("Student not found: " + studentId));
+        student.setStatus(StudentStatus.ADMISSION_CANCELLED);
+        student.setReasonForLeaving(trimToNull(reason) == null ? "Admission cancelled before joining" : reason.trim());
+        student.setLeavingDate(null);
+        Student saved = studentRepository.save(student);
+        studentLoginService.deactivate(schoolId, studentId);
+        parentPortalService.endRelationshipsForExitedStudent(schoolId, studentId, today);
+        auditService.log(securityUtil.getUsername(), securityUtil.getRole(), "CANCEL_ADMISSION", "Student",
+                studentId, "UPCOMING", "ADMISSION_CANCELLED", httpRequest.getRemoteAddr());
+        log.info("Admission cancelled for student {}", studentId);
+        return saved;
+    }
+
+    @Transactional(readOnly = true)
+    public StudentAdmissionDtos.LoginStatus loginStatus(String studentId) {
+        Long schoolId = securityUtil.getSchoolId();
+        requireStudent(schoolId, studentId);
+        StudentLoginService.LoginStatus status = studentLoginService.status(schoolId, studentId);
+        return new StudentAdmissionDtos.LoginStatus(status.exists(), status.active());
+    }
+
+    /**
+     * Creates the login for an existing student who has none (e.g. the old two-step admission
+     * failed half-way). Refused when any login already exists, so repeating it never creates a
+     * second account; refused for students who left by transfer, withdrawal or cancellation.
+     */
+    @Transactional
+    public StudentAdmissionDtos.LoginStatus createMissingLogin(String studentId, HttpServletRequest httpRequest) {
+        Long schoolId = securityUtil.getSchoolId();
+        Student student = requireStudent(schoolId, studentId);
+        StudentStatus status = student.getStatus();
+        if (status != null && status.isExitStatus() && status != StudentStatus.GRADUATED) {
+            throw new IllegalStateException("A login can't be created for a student who is " + status + ".");
+        }
+        if (userRepository.findByUserId(studentId).isPresent()) {
+            throw new IllegalStateException("A login already exists for this student.");
+        }
+        try {
+            studentLoginService.create(student);
+        } catch (org.springframework.dao.DataIntegrityViolationException race) {
+            throw new IllegalStateException("A login already exists for this student.");
+        }
+        auditService.log(securityUtil.getUsername(), securityUtil.getRole(), "CREATE_STUDENT_LOGIN", "User",
+                studentId, null, "Initial password = date of birth; must change at first login", httpRequest.getRemoteAddr());
+        return new StudentAdmissionDtos.LoginStatus(true, true);
+    }
+
+    /** Read-only enrollment history, oldest first. */
+    @Transactional(readOnly = true)
+    public List<StudentAdmissionDtos.EnrollmentHistoryItem> enrollmentHistory(String studentId) {
+        Long schoolId = securityUtil.getSchoolId();
+        requireStudent(schoolId, studentId);
+        java.util.Map<Long, String> labels = new java.util.HashMap<>();
+        return studentEnrollmentRepository
+                .findBySchoolIdAndStudentIdOrderByAcademicSessionIdAscEffectiveFromAsc(schoolId, studentId).stream()
+                .sorted(java.util.Comparator.comparing(StudentEnrollment::getEffectiveFrom)
+                        .thenComparing(StudentEnrollment::getId))
+                .map(e -> new StudentAdmissionDtos.EnrollmentHistoryItem(
+                        e.getId(), e.getAcademicSessionId(),
+                        labels.computeIfAbsent(e.getAcademicSessionId(), id -> academicSessionRepository
+                                .findByIdAndSchoolId(id, schoolId).map(AcademicSession::getLabel).orElse(null)),
+                        e.getClassId(), e.getClassNameSnapshot(), e.getSectionId(), e.getSectionNameSnapshot(),
+                        e.getStatus(), historyState(e), e.getEffectiveFrom(), e.getEffectiveUntil(), e.getClosureReason()))
+                .toList();
+    }
+
+    private static String historyState(StudentEnrollment e) {
+        return switch (e.getStatus()) {
+            case ACTIVE -> "CURRENT";
+            case PLANNED -> "UPCOMING";
+            case CLOSED -> "CLOSED";
+            case CANCELLED -> "CANCELLED";
+        };
+    }
+
+    /** Parent links ended by the student's last exit, offered for restoration after readmission. */
+    @Transactional(readOnly = true)
+    public List<StudentAdmissionDtos.RestorableParentLink> restorableParentLinks(String studentId) {
+        Long schoolId = securityUtil.getSchoolId();
+        Student student = requireStudent(schoolId, studentId);
+        if (student.getStatus() != null && student.getStatus().isExitStatus()) return List.of();
+        LocalDate[] window = readmissionWindow(schoolId, studentId);
+        return window == null ? List.of()
+                : parentPortalService.endedLinksSince(schoolId, studentId, window[0], window[1]);
+    }
+
+    @Transactional
+    public int restoreParentLinks(String studentId, List<Long> relationshipIds, HttpServletRequest httpRequest) {
+        Long schoolId = securityUtil.getSchoolId();
+        requireStudent(schoolId, studentId);
+        LocalDate[] window = readmissionWindow(schoolId, studentId);
+        if (window == null) {
+            throw new IllegalStateException("This student has no readmission to restore parent access for.");
+        }
+        int restored = parentPortalService.restoreLinks(schoolId, studentId, window[0], window[1], relationshipIds);
+        auditService.log(securityUtil.getUsername(), securityUtil.getRole(), "RESTORE_PARENT_LINKS", "Student",
+                studentId, null, "relationships=" + relationshipIds, httpRequest.getRemoteAddr());
+        return restored;
+    }
+
+    /**
+     * [last exit date, readmission date]: the last exit is the latest leaving/cancellation among
+     * the enrollment history; the readmission is the first realized enrollment starting after it.
+     * Null when the student was never readmitted.
+     */
+    private LocalDate[] readmissionWindow(Long schoolId, String studentId) {
+        List<StudentEnrollment> history = studentEnrollmentRepository
+                .findBySchoolIdAndStudentIdOrderByAcademicSessionIdAscEffectiveFromAsc(schoolId, studentId);
+        LocalDate lastExit = null;
+        boolean lastExitWasCancellation = false;
+        for (StudentEnrollment e : history) {
+            StudentEnrollmentClosureReason reason = e.getClosureReason();
+            LocalDate exitDate = null;
+            boolean cancellation = false;
+            if (e.getStatus() == StudentEnrollmentStatus.CLOSED && (reason == StudentEnrollmentClosureReason.GRADUATED
+                    || reason == StudentEnrollmentClosureReason.TRANSFERRED || reason == StudentEnrollmentClosureReason.WITHDRAWN)) {
+                exitDate = e.getEffectiveUntil();
+            } else if (e.getStatus() == StudentEnrollmentStatus.CANCELLED && e.getUpdatedAt() != null) {
+                exitDate = e.getUpdatedAt().toLocalDate();   // parent links end on the cancellation day
+                cancellation = true;
+            }
+            if (exitDate != null && (lastExit == null || exitDate.isAfter(lastExit))) {
+                lastExit = exitDate;
+                lastExitWasCancellation = cancellation;
+            }
+        }
+        if (lastExit == null) return null;
+        final LocalDate since = lastExit;
+        final boolean inclusive = lastExitWasCancellation;
+        return history.stream()
+                .filter(e -> e.getStatus() == StudentEnrollmentStatus.ACTIVE || e.getStatus() == StudentEnrollmentStatus.CLOSED)
+                .map(StudentEnrollment::getEffectiveFrom)
+                .filter(from -> from.isAfter(since) || (inclusive && from.isEqual(since)))
+                .min(java.util.Comparator.naturalOrder())
+                .map(readmitted -> new LocalDate[]{since, readmitted})
+                .orElse(null);
+    }
+
+    private Student requireStudent(Long schoolId, String studentId) {
+        return studentRepository.findByStudentIdAndSchoolId(studentId, schoolId)
+                .orElseThrow(() -> new NoSuchElementException("Student not found: " + studentId));
     }
 
     private StudentStatus calculateStatus(LocalDate joiningDate, LocalDate leavingDate, StudentStatus currentStatus) {
@@ -433,160 +692,234 @@ public class StudentService {
         return StudentStatus.ACTIVE;
     }
 
+    /** Older entry point kept for internal callers: only the admin-editable fields are read. */
     @Transactional
     public Student updateStudent(String studentId, Student updatedStudent, Integer effectiveFromMonth, HttpServletRequest request) {
-        if (studentId == null || studentId.trim().isEmpty() || updatedStudent == null) {
-            log.error("Invalid input for updateStudent: studentId or updatedStudent is null/empty.");
+        if (updatedStudent == null) {
             throw new IllegalArgumentException("Student ID and updated student object must be provided.");
+        }
+        return updateStudent(studentId, new StudentAdmissionDtos.UpdateRequest(
+                updatedStudent.getName(), updatedStudent.getEmail(), updatedStudent.getPhoneNumber(),
+                updatedStudent.getDob(), updatedStudent.getClassName(), updatedStudent.getSectionId(),
+                updatedStudent.getGender(), updatedStudent.getFatherName(), updatedStudent.getMotherName(),
+                updatedStudent.getTakesBus(), updatedStudent.getDistance(), updatedStudent.getJoiningDate()),
+                effectiveFromMonth, request);
+    }
+
+    /**
+     * Edits a student. Only admin-editable fields are applied to the stored record, so status,
+     * exit details, the stored photo key and every other lifecycle field are never overwritten.
+     * Class, section and joining-date changes go through the enrollment lifecycle:
+     * <ul>
+     *   <li>UPCOMING: the not-yet-started PLANNED enrollment is corrected/rescheduled.</li>
+     *   <li>ACTIVE: a class/section change is a dated transition from today (an in-place fix only
+     *       when the enrollment started today and nothing was recorded under it yet); a joining
+     *       date is corrected only when no attendance or marks exist and there is no other history.</li>
+     *   <li>Left / cancelled: membership can only change through readmission.</li>
+     * </ul>
+     */
+    @Transactional
+    public Student updateStudent(String studentId, StudentAdmissionDtos.UpdateRequest update,
+                                 Integer effectiveFromMonth, HttpServletRequest request) {
+        if (studentId == null || studentId.trim().isEmpty() || update == null) {
+            log.error("Invalid input for updateStudent: studentId or update is null/empty.");
+            throw new IllegalArgumentException("Student ID and updated student object must be provided.");
+        }
+        if (update.name() == null || update.name().isBlank()) {
+            throw new IllegalArgumentException("Name is required.");
         }
         log.info("Attempting to update student with ID: {}", studentId);
 
         Long schoolId = securityUtil.getSchoolId();
-        try {
-            Optional<Student> existingStudentOptional = studentRepository.findByStudentIdAndSchoolId(studentId, schoolId);
-            if (existingStudentOptional.isEmpty()) {
-                log.warn("Student with ID {} not found for update.", studentId);
-                throw new NoSuchElementException("Student with ID " + studentId + " not found");
+        Student existing = studentRepository.findByStudentIdAndSchoolId(studentId, schoolId)
+                .orElseThrow(() -> new NoSuchElementException("Student with ID " + studentId + " not found"));
+        String oldValue = toJson(existing);
+
+        // SchoolClass is authoritative — validated before any side effect runs.
+        SchoolClass schoolClass = resolveAndValidateClass(schoolId, update.className());
+        Section requestedSection = resolveSection(schoolId, schoolClass, update.sectionId());
+        Long requestedSectionId = requestedSection == null ? null : requestedSection.getId();
+
+        LocalDate today = schoolToday(schoolId);
+        List<StudentEnrollment> history = studentEnrollmentRepository
+                .findBySchoolIdAndStudentIdOrderByAcademicSessionIdAscEffectiveFromAsc(schoolId, studentId);
+        Optional<AcademicSession> todaySession = findSessionContaining(schoolId, today);
+        Optional<StudentEnrollment> effective = todaySession.flatMap(session ->
+                studentEnrollmentService.findEffectiveEnrollment(schoolId, studentId, session.getId(), today));
+        boolean covered = effective.isPresent()
+                || history.stream().anyMatch(e -> e.getStatus() != StudentEnrollmentStatus.CANCELLED);
+
+        Long currentClassId = effective.map(StudentEnrollment::getClassId).orElse(existing.getClassId());
+        Long currentSectionId = effective.map(StudentEnrollment::getSectionId).orElse(existing.getSectionId());
+        boolean classChanged = !Objects.equals(currentClassId, schoolClass.getId());
+        boolean sectionChanged = !Objects.equals(currentSectionId, requestedSectionId);
+        boolean joiningChanged = update.joiningDate() != null
+                && !Objects.equals(existing.getJoiningDate(), update.joiningDate());
+
+        boolean busDetailsChanged = !Objects.equals(existing.getTakesBus(), update.takesBus())
+                || (Boolean.TRUE.equals(update.takesBus()) && !Objects.equals(existing.getDistance(), update.distance()));
+        boolean emailChanged = !Objects.equals(existing.getEmail(), trimToNull(update.email()));
+
+        existing.setName(update.name().trim());
+        existing.setEmail(trimToNull(update.email()));
+        existing.setPhoneNumber(trimToNull(update.phoneNumber()));
+        if (update.dob() != null) existing.setDob(update.dob());
+        existing.setGender(trimToNull(update.gender()));
+        existing.setFatherName(trimToNull(update.fatherName()));
+        existing.setMotherName(trimToNull(update.motherName()));
+        existing.setTakesBus(update.takesBus());
+        existing.setDistance(update.distance());
+
+        if (classChanged || sectionChanged || joiningChanged) {
+            StudentStatus status = existing.getStatus();
+            if (status != null && status.isExitStatus()) {
+                throw new IllegalArgumentException("This student is no longer enrolled (" + status
+                        + "). Use Re-admit to place them in a class again.");
             }
-
-            Student existingStudent = existingStudentOptional.get();
-
-            // SchoolClass is authoritative — validated early, before any class-change side
-            // effects (fee recalculation below) run for a class that may not even exist.
-            SchoolClass schoolClass = resolveAndValidateClass(schoolId, updatedStudent.getClassName());
-            updatedStudent.setClassName(schoolClass.getName());
-            updatedStudent.setClassId(schoolClass.getId());
-            if (updatedStudent.getSectionId() != null) {
-                resolveAndValidateSection(schoolId, schoolClass, updatedStudent);
+            if (!covered) {
+                applyLegacyMembershipEdit(existing, schoolClass, requestedSection, classChanged, joiningChanged, update);
+            } else if (effective.isPresent()) {
+                applyActiveMembershipEdit(schoolId, existing, todaySession.orElseThrow(), today, schoolClass,
+                        requestedSectionId, classChanged, sectionChanged, joiningChanged ? update.joiningDate() : null);
+            } else if (status == StudentStatus.UPCOMING) {
+                applyUpcomingMembershipEdit(schoolId, existing, history, schoolClass, requestedSectionId,
+                        classChanged || sectionChanged, joiningChanged ? update.joiningDate() : null);
+            } else if (status == StudentStatus.ACTIVE) {
+                throw new IllegalStateException("No current enrollment covers today, so class, section and "
+                        + "joining date can't be changed here.");
             } else {
-                updatedStudent.setSectionName(null);
+                throw new IllegalStateException("Class, section and joining date can't be changed for status " + status + ".");
             }
+        }
 
-            LocalDate effectiveDate = schoolToday(schoolId);
-            Optional<AcademicSession> effectiveSession = findSessionContaining(schoolId, effectiveDate);
-            Optional<StudentEnrollment> effectiveEnrollment = effectiveSession.flatMap(session ->
-                    studentEnrollmentService.findEffectiveEnrollment(
-                            schoolId, studentId, session.getId(), effectiveDate));
+        if (emailChanged) {
+            userDetailsService.findUserByUserId(studentId).ifPresent(user -> {
+                user.setEmail(existing.getEmail());
+                userDetailsService.save(user);
+            });
+        }
 
-            // Comparison logic: uses canonical IDs after tenant-safe validation.
-            boolean emailChanged = !Objects.equals(existingStudent.getEmail(), updatedStudent.getEmail());
-            Long authoritativeClassId = effectiveEnrollment.map(StudentEnrollment::getClassId)
-                    .orElse(existingStudent.getClassId());
-            Long authoritativeSectionId = effectiveEnrollment.map(StudentEnrollment::getSectionId)
-                    .orElse(existingStudent.getSectionId());
-            boolean classChanged = !Objects.equals(authoritativeClassId, updatedStudent.getClassId());
-            boolean sectionChanged = !Objects.equals(authoritativeSectionId, updatedStudent.getSectionId());
-            boolean joiningDateChanged = !Objects.equals(existingStudent.getJoiningDate(), updatedStudent.getJoiningDate());
-            boolean leavingDateChanged = !Objects.equals(existingStudent.getLeavingDate(), updatedStudent.getLeavingDate());
-            if (effectiveEnrollment.isPresent() && (joiningDateChanged || leavingDateChanged)) {
-                throw new IllegalArgumentException(
-                        "Joining/leaving dates for an enrolled student require the explicit enrollment lifecycle workflow.");
+        Student savedStudent = studentRepository.save(existing);
+        auditService.logUpdate(securityUtil.getUsername(), securityUtil.getRole(), "UPDATE_STUDENT", "Student",
+                studentId, oldValue, toJson(savedStudent), request.getRemoteAddr());
+        log.info("Successfully saved updated student record for ID: {}", studentId);
+
+        if (busDetailsChanged && existing.getTakesBus() != null) {
+            log.info("Bus details changed for student {}. Updating bus fees from month: {}", studentId, effectiveFromMonth);
+            studentFeesService.updateStudentBusFees(studentId, existing.getTakesBus(), existing.getDistance(), effectiveFromMonth);
+        }
+        return savedStudent;
+    }
+
+    /** Pre-enrollment (legacy) students keep the old projection-only behaviour. */
+    private void applyLegacyMembershipEdit(Student existing, SchoolClass schoolClass, Section section,
+                                           boolean classChanged, boolean joiningChanged,
+                                           StudentAdmissionDtos.UpdateRequest update) {
+        existing.setClassId(schoolClass.getId());
+        existing.setClassName(schoolClass.getName());
+        existing.setSectionId(section == null ? null : section.getId());
+        existing.setSectionName(section == null ? null : section.getName());
+        if (classChanged) {
+            studentFeesService.updateStudentFeesForClassChange(existing.getStudentId(), schoolClass.getName());
+        }
+        if (joiningChanged) {
+            existing.setJoiningDate(update.joiningDate());
+            existing.setStatus(calculateStatus(update.joiningDate(), existing.getLeavingDate(), existing.getStatus()));
+        }
+    }
+
+    /** UPCOMING: correct the class/section and/or move the date of the one PLANNED admission row. */
+    private void applyUpcomingMembershipEdit(Long schoolId, Student existing, List<StudentEnrollment> history,
+                                             SchoolClass schoolClass, Long sectionId,
+                                             boolean membershipChanged, LocalDate newJoiningDate) {
+        String studentId = existing.getStudentId();
+        if (membershipChanged) {
+            StudentEnrollment planned = history.stream()
+                    .filter(e -> e.getStatus() == StudentEnrollmentStatus.PLANNED)
+                    .findFirst()
+                    .orElseThrow(() -> new IllegalStateException("This upcoming student has no planned enrollment to correct."));
+            // Corrected while still PLANNED (before any date move could start it).
+            StudentEnrollment corrected = studentEnrollmentService.correctPlannedEnrollment(
+                    schoolId, studentId, planned.getId(), schoolClass.getId(), sectionId);
+            existing.setClassId(corrected.getClassId());
+            existing.setClassName(corrected.getClassNameSnapshot());
+            existing.setSectionId(corrected.getSectionId());
+            existing.setSectionName(corrected.getSectionNameSnapshot());
+        }
+        if (newJoiningDate != null) {
+            StudentEnrollment moved = studentEnrollmentService.reschedulePlannedAdmission(schoolId, studentId, newJoiningDate);
+            existing.setJoiningDate(moved.getEffectiveFrom());
+            if (moved.getStatus() == StudentEnrollmentStatus.ACTIVE) {
+                existing.setStatus(StudentStatus.ACTIVE);
             }
+        }
+    }
 
-            boolean busDetailsChanged = false;
-            // Check 1: Bus status changed?
-            if (!Objects.equals(existingStudent.getTakesBus(), updatedStudent.getTakesBus())) {
-                busDetailsChanged = true;
+    /** ACTIVE: conservative corrections that never rewrite recorded attendance or marks. */
+    private void applyActiveMembershipEdit(Long schoolId, Student existing, AcademicSession session, LocalDate today,
+                                           SchoolClass schoolClass, Long sectionId,
+                                           boolean classChanged, boolean sectionChanged, LocalDate newJoiningDate) {
+        String studentId = existing.getStudentId();
+        if (newJoiningDate != null) {
+            if (hasAttendanceSince(schoolId, studentId, null) || hasMarksSince(schoolId, studentId, null)) {
+                throw new IllegalArgumentException("The joining date can't be changed because attendance or marks "
+                        + "have already been recorded for this student.");
             }
-            // Check 2: Distance changed while bus is enabled?
-            if (Boolean.TRUE.equals(updatedStudent.getTakesBus()) && !Objects.equals(existingStudent.getDistance(), updatedStudent.getDistance())) {
-                busDetailsChanged = true;
+            studentEnrollmentService.correctActiveStartDate(schoolId, studentId, newJoiningDate);
+            existing.setJoiningDate(newJoiningDate);
+        }
+        if (classChanged || sectionChanged) {
+            StudentEnrollment current = studentEnrollmentService
+                    .findEffectiveEnrollment(schoolId, studentId, session.getId(), today)
+                    .orElseThrow(() -> new IllegalStateException("No current enrollment covers today."));
+            if (!current.getEffectiveFrom().isBefore(today)
+                    && (hasAttendanceSince(schoolId, studentId, current.getEffectiveFrom())
+                        || hasMarksSince(schoolId, studentId, current.getEffectiveFrom()))) {
+                throw new IllegalArgumentException("Attendance or marks were already recorded today under Class "
+                        + current.getClassNameSnapshot() + (current.getSectionNameSnapshot() == null ? "" : " " + current.getSectionNameSnapshot())
+                        + ". Those records stay with that class, so the class/section can be changed from tomorrow.");
             }
+            StudentEnrollmentService.EnrollmentTransition transition = classChanged
+                    ? studentEnrollmentService.transitionClass(schoolId, studentId, session.getId(),
+                            schoolClass.getId(), sectionId, today)
+                    : studentEnrollmentService.transitionSection(schoolId, studentId, session.getId(), sectionId, today);
+            StudentEnrollment replacement = transition.replacementSegment();
+            existing.setClassId(replacement.getClassId());
+            existing.setClassName(replacement.getClassNameSnapshot());
+            existing.setSectionId(replacement.getSectionId());
+            existing.setSectionName(replacement.getSectionNameSnapshot());
+            log.info("Enrollment-backed membership change for student {} effective {} ({}).", studentId, today,
+                    transition.closedSegment() == null ? "corrected in place" : "previous period closed");
+        }
+    }
 
-            if (emailChanged) {
-                log.info("Email change detected for student {}. Updating user details.", studentId);
-                Optional<User> userOptional = userDetailsService.findUserByUserId(studentId);
-                userOptional.ifPresentOrElse(user -> {
-                    user.setEmail(updatedStudent.getEmail());
-                    userDetailsService.save(user);
-                    log.info("Successfully updated user email for student ID: {}", studentId);
-                }, () -> log.warn("User record not found for student ID {} when attempting to update email.", studentId));
-            }
+    private boolean hasAttendanceSince(Long schoolId, String studentId, LocalDate from) {
+        return !studentAttendanceRepository.findStudentRows(schoolId, studentId,
+                from == null ? LocalDate.of(1900, 1, 1) : from, LocalDate.of(9999, 12, 31)).isEmpty();
+    }
 
-            if (effectiveEnrollment.isPresent() && (classChanged || sectionChanged)) {
-                StudentEnrollmentService.EnrollmentTransition transition = classChanged
-                        ? studentEnrollmentService.transitionClass(schoolId, studentId, effectiveSession.orElseThrow().getId(),
-                                updatedStudent.getClassId(), updatedStudent.getSectionId(), effectiveDate)
-                        : studentEnrollmentService.transitionSection(schoolId, studentId, effectiveSession.orElseThrow().getId(),
-                                updatedStudent.getSectionId(), effectiveDate);
-                StudentEnrollment replacement = transition.replacementSegment();
-                updatedStudent.setClassId(replacement.getClassId());
-                updatedStudent.setClassName(replacement.getClassNameSnapshot());
-                updatedStudent.setSectionId(replacement.getSectionId());
-                updatedStudent.setSectionName(replacement.getSectionNameSnapshot());
-                log.info("Enrollment-backed membership transition completed for student {} effective {}.",
-                        studentId, effectiveDate);
-            } else if (effectiveEnrollment.isPresent()) {
-                // Full-object update DTOs resend projection fields even for an unrelated edit.
-                // Never let a stale client payload overwrite authoritative membership.
-                StudentEnrollment authoritative = effectiveEnrollment.orElseThrow();
-                updatedStudent.setClassId(authoritative.getClassId());
-                updatedStudent.setClassName(authoritative.getClassNameSnapshot());
-                updatedStudent.setSectionId(authoritative.getSectionId());
-                updatedStudent.setSectionName(authoritative.getSectionNameSnapshot());
-            } else if (effectiveEnrollment.isEmpty() && classChanged) {
-                // Legacy uncovered students retain the pre-enrollment behavior. Covered students
-                // deliberately do not relabel financial rows as an implicit consequence of a
-                // membership transition; that requires a separate fee-policy decision.
-                studentFeesService.updateStudentFeesForClassChange(studentId, updatedStudent.getClassName());
-            }
+    private boolean hasMarksSince(Long schoolId, String studentId, LocalDate from) {
+        return studentMarkRepository.findByStudentIdAndSchoolId(studentId, schoolId).stream()
+                .anyMatch(mark -> from == null || mark.getCreatedAt() == null
+                        || !mark.getCreatedAt().toLocalDate().isBefore(from));
+    }
 
-            // Ensure the correct ID and school are set before saving
-            updatedStudent.setStudentId(studentId);
-            updatedStudent.setSchoolId(schoolId);
-            // updatedStudent is freshly deserialized from the request body, not the
-            // existingStudent loaded above — without this, Persistable.isNew() would
-            // default true and save() would wrongly attempt an INSERT of a row that
-            // already exists. We already confirmed existence at line ~336-339.
-            updatedStudent.markAsExisting();
+    private Section resolveSection(Long schoolId, SchoolClass schoolClass, Long sectionId) {
+        if (sectionId == null) return null;
+        Section section = sectionRepository.findByIdAndSchoolId(sectionId, schoolId)
+                .orElseThrow(() -> new IllegalArgumentException("Section not found for this school."));
+        if (!section.getClassId().equals(schoolClass.getId())) {
+            throw new IllegalArgumentException(
+                    "Section '" + section.getName() + "' does not belong to class '" + schoolClass.getName() + "'.");
+        }
+        return section;
+    }
 
-            if (joiningDateChanged || leavingDateChanged) {
-                StudentStatus newStatus = calculateStatus(
-                        updatedStudent.getJoiningDate(),
-                        updatedStudent.getLeavingDate(),
-                        existingStudent.getStatus()
-                );
-                updatedStudent.setStatus(newStatus);
-                log.info("Status updated for student {} → {}", studentId, newStatus);
-            }
-
-            String oldValue = objectMapper.writeValueAsString(existingStudentOptional.get());
-
-            Student savedStudent = studentRepository.save(updatedStudent);
-
-            auditService.logUpdate(
-                    securityUtil.getUsername(),
-                    securityUtil.getRole(),
-                    "UPDATE_STUDENT",
-                    "Student",
-                    studentId,
-                    oldValue,
-                    objectMapper.writeValueAsString(savedStudent),
-                    request.getRemoteAddr()
-            );
-
-            log.info("Successfully saved updated student record for ID: {}", studentId);
-
-            if (busDetailsChanged && updatedStudent.getTakesBus() != null) {
-                log.info("Bus details changed for student {}. Updating bus fees from month: {}", studentId, effectiveFromMonth);
-                studentFeesService.updateStudentBusFees(
-                        studentId,
-                        updatedStudent.getTakesBus(),
-                        updatedStudent.getDistance(),
-                        effectiveFromMonth
-                );
-            }
-
-            return savedStudent;
-        } catch (DataAccessException e) {
-            log.error("Data access error while updating student with ID: {}", studentId, e);
-            throw new RuntimeException("Failed to update student due to a database issue.", e);
-        } catch (NoSuchElementException | IllegalArgumentException e) {
-            // Re-throw specific business exceptions (e.g. class/section validation failures)
-            throw e;
-        } catch (Exception e) {
-            log.error("Unexpected error while updating student with ID: {}", studentId, e);
-            throw new RuntimeException("An unexpected error occurred while updating the student.", e);
+    private String toJson(Student student) {
+        try {
+            return objectMapper.writeValueAsString(student);
+        } catch (JsonProcessingException e) {
+            return student.getStudentId();
         }
     }
 

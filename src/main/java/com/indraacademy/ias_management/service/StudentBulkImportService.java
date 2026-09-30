@@ -2,28 +2,22 @@ package com.indraacademy.ias_management.service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.indraacademy.ias_management.config.Role;
 import com.indraacademy.ias_management.dto.BulkImportResultDTO;
 import com.indraacademy.ias_management.entity.Student;
-import com.indraacademy.ias_management.entity.User;
 import com.indraacademy.ias_management.repository.SchoolClassRepository;
 import com.indraacademy.ias_management.repository.SectionRepository;
-import com.indraacademy.ias_management.repository.UserRepository;
 import com.indraacademy.ias_management.util.SecurityUtil;
 import com.opencsv.CSVReader;
 import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDate;
-import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -52,7 +46,7 @@ import java.util.Map;
  *  Takes Bus       | takesBus       | no       | true / false (default: false)
  *  Distance (km)   | distance       | no       | numeric (default: 0.0)
  *  Joining Date    | joiningDate    | yes      | yyyy-MM-dd
- *  Leaving Date    | leavingDate    | no       | yyyy-MM-dd
+ *  (Leaving Date)  | —              | —        | a value is rejected: a new admission has no exit; use the exit workflow
  *
  * Edunexify always generates the Student ID for every newly imported student — a "Student
  * ID" column is no longer part of the downloadable template. An OLDER CSV that still has one
@@ -61,7 +55,10 @@ import java.util.Map;
  * so the admin isn't left guessing why the values they typed there didn't take effect.
  *
  * Processing rules:
- * - Each row is saved in its own transaction (via StudentService.addStudent).
+ * - Each row is saved in its own transaction (via StudentService.addStudent), which creates the
+ *   student, enrollment and login together — a failure at any step rolls back that row only.
+ * - An unknown Section is a row error (never silently dropped); a Leaving Date is rejected; a
+ *   second row with the same name and date of birth as an earlier row in the file is rejected.
  *   A failure on one row does not roll back previously saved rows.
  * - Blank rows are silently skipped.
  * - Row numbers in error reports are 1-indexed; row 1 is the header.
@@ -76,22 +73,17 @@ public class StudentBulkImportService {
     public static final String[] TEMPLATE_HEADERS = {
             "Student Name", "Email", "Phone Number",
             "Date of Birth", "Class", "Section", "Gender", "Father Name", "Mother Name",
-            "Takes Bus", "Distance (km)", "Joining Date", "Leaving Date"
+            "Takes Bus", "Distance (km)", "Joining Date"
     };
 
     private static final String LEGACY_ID_COLUMN = "student id";
-
-    private static final DateTimeFormatter DOB_FORMATTER = DateTimeFormatter.ofPattern("yyyyMMdd");
 
     @Autowired private StudentService studentService;
     @Autowired private AuditService auditService;
     @Autowired private SecurityUtil securityUtil;
     @Autowired private ObjectMapper objectMapper;
-    @Autowired private UserRepository userRepository;
-    @Autowired private PasswordEncoder passwordEncoder;
     @Autowired private SchoolClassRepository schoolClassRepository;
     @Autowired private SectionRepository sectionRepository;
-    @Autowired private WelcomeEmailService welcomeEmailService;
 
     /**
      * Parses the uploaded CSV, attempts to save each data row, and returns
@@ -114,6 +106,7 @@ public class StudentBulkImportService {
             boolean hasLegacyIdColumn = columnIndex.containsKey(LEGACY_ID_COLUMN);
 
             String[] row;
+            Map<String, Integer> seenNameDob = new HashMap<>();
             int rowNum = 1; // header is row 1; data starts at row 2
             while ((row = reader.readNext()) != null) {
                 rowNum++;
@@ -125,18 +118,25 @@ public class StudentBulkImportService {
                     Student student = parseRow(row, columnIndex, rowNum, errors);
                     if (student == null) continue; // validation error already recorded
 
-                    // Each addStudent call runs in its own @Transactional context —
-                    // a failure here does not affect rows already committed. studentId is
-                    // intentionally left unset on `student` here; addStudent() generates it.
+                    String duplicateKey = student.getName().trim().toLowerCase(Locale.ROOT) + "|" + student.getDob();
+                    Integer firstRow = seenNameDob.putIfAbsent(duplicateKey, rowNum);
+                    if (firstRow != null) {
+                        errors.add(new BulkImportResultDTO.RowError(rowNum, name,
+                                "Duplicate of row " + firstRow + " (same name and date of birth) — not imported"));
+                        continue;
+                    }
+
+                    // Each addStudent call runs in its own @Transactional context and creates the
+                    // student, enrollment and login together — a failure rolls back this row only.
+                    // studentId is intentionally left unset; addStudent() generates it.
                     Student saved = studentService.addStudent(student, request);
-                    createUserAccount(saved.getStudentId(), saved.getName(), saved.getEmail(),
-                            saved.getDob(), Role.STUDENT);
                     successful++;
                     created.add(new BulkImportResultDTO.RowSuccess(rowNum, saved.getName(), saved.getStudentId()));
                     log.info("Bulk import: row {} saved (studentId={})", rowNum, saved.getStudentId());
 
-                } catch (IllegalArgumentException e) {
-                    // Covers duplicate ID and other business-rule rejections from addStudent.
+                } catch (IllegalArgumentException | IllegalStateException e) {
+                    // Business-rule rejections from addStudent (duplicate ID, session rules, a login
+                    // that can't be created). The row's transaction has already rolled back.
                     log.warn("Bulk import: row {} rejected (name={}): {}", rowNum, name, e.getMessage());
                     errors.add(new BulkImportResultDTO.RowError(rowNum, name, e.getMessage()));
                 } catch (Exception e) {
@@ -163,31 +163,6 @@ public class StudentBulkImportService {
             "This file included a 'Student ID' column. Edunexify now generates the account ID "
                     + "automatically for every new student, so the values in that column were not "
                     + "used. See the generated ID for each row below.";
-
-    /**
-     * Creates a User login account for the imported student.
-     * Initial password: DOB formatted as yyyyMMdd (e.g. "20050315") — DOB is a
-     * required field for this import, so it is always present here. The
-     * account is flagged mustChangePassword so the student is forced to set
-     * a real password on first login.
-     *
-     * Sends the welcome email only after save() succeeds — a per-row failure never reaches
-     * this point (caught by the caller's try/catch), so a retried import of an already-created
-     * row cannot trigger a second send for the same student.
-     */
-    private void createUserAccount(String studentId, String name, String email, LocalDate dob, String role) {
-        String rawPassword = dob.format(DOB_FORMATTER);
-        User user = new User();
-        user.setUserId(studentId);
-        user.setEmail(email);
-        user.setRole(role);
-        user.setPassword(passwordEncoder.encode(rawPassword));
-        user.setSchoolId(securityUtil.getSchoolId());
-        user.setMustChangePassword(true);
-        userRepository.save(user);
-        log.info("Bulk import: created User account for studentId={}", studentId);
-        welcomeEmailService.sendWelcomeEmail(studentId, name, role, email, user.getSchoolId());
-    }
 
     /**
      * Writes a single BULK_IMPORT_STUDENT audit entry summarising the entire import session.
@@ -290,15 +265,10 @@ public class StudentBulkImportService {
             return null;
         }
 
-        LocalDate leavingDate = null;
         if (!leavingStr.isEmpty()) {
-            try {
-                leavingDate = LocalDate.parse(leavingStr);
-            } catch (DateTimeParseException e) {
-                errors.add(new BulkImportResultDTO.RowError(rowNum, name,
-                        "Invalid date format for 'Leaving Date', expected yyyy-MM-dd"));
-                return null;
-            }
+            errors.add(new BulkImportResultDTO.RowError(rowNum, name,
+                    "Leaving Date must be empty for a new admission — use the student exit workflow instead"));
+            return null;
         }
 
         // Boolean parsing
@@ -333,31 +303,29 @@ public class StudentBulkImportService {
         student.setPhoneNumber(phoneNumber.isEmpty()  ? null : phoneNumber);
         student.setDob(dob);
         student.setClassName(className);
-        // Dual-write: resolve className → classId
+        // Resolve className → classId, and section name → section. An unknown class is rejected
+        // by addStudent; an unknown section is a row error here — never silently dropped.
         Long schoolId = securityUtil.getSchoolId();
-        schoolClassRepository.findBySchoolIdAndName(schoolId, className)
-                .ifPresent(sc -> {
-                    student.setClassId(sc.getId());
-                    // Resolve section name → sectionId + sectionName
-                    if (!sectionName.isEmpty()) {
-                        sectionRepository.findBySchoolIdAndClassIdAndName(schoolId, sc.getId(), sectionName)
-                                .ifPresentOrElse(
-                                        sec -> {
-                                            student.setSectionId(sec.getId());
-                                            student.setSectionName(sec.getName());
-                                        },
-                                        () -> log.warn("Bulk import: row {} — section '{}' not found for class '{}', skipping section assignment",
-                                                rowNum, sectionName, className)
-                                );
-                    }
-                });
+        var schoolClass = schoolClassRepository.findBySchoolIdAndName(schoolId, className);
+        if (schoolClass.isPresent()) {
+            student.setClassId(schoolClass.get().getId());
+            if (!sectionName.isEmpty()) {
+                var section = sectionRepository.findBySchoolIdAndClassIdAndName(schoolId, schoolClass.get().getId(), sectionName);
+                if (section.isEmpty()) {
+                    errors.add(new BulkImportResultDTO.RowError(rowNum, name,
+                            "Section '" + sectionName + "' does not exist for class '" + className + "'"));
+                    return null;
+                }
+                student.setSectionId(section.get().getId());
+                student.setSectionName(section.get().getName());
+            }
+        }
         student.setGender(gender.isEmpty()             ? null : gender);
         student.setFatherName(fatherName.isEmpty()     ? null : fatherName);
         student.setMotherName(motherName.isEmpty()     ? null : motherName);
         student.setTakesBus(takesBus);
         student.setDistance(distance);
         student.setJoiningDate(joiningDate);
-        student.setLeavingDate(leavingDate);
         return student;
     }
 

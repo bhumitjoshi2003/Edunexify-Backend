@@ -12,6 +12,8 @@ import com.indraacademy.ias_management.entity.StudentEnrollmentStatus;
 import com.indraacademy.ias_management.entity.StudentStatus;
 import com.indraacademy.ias_management.dto.StudentExitRequest;
 import com.indraacademy.ias_management.repository.StudentAttendanceRepository;
+import com.indraacademy.ias_management.repository.StudentEnrollmentRepository;
+import com.indraacademy.ias_management.repository.StudentMarkRepository;
 import com.indraacademy.ias_management.repository.LeaveRepository;
 import com.indraacademy.ias_management.repository.PaymentRepository;
 import com.indraacademy.ias_management.repository.SchoolClassRepository;
@@ -79,6 +81,9 @@ class StudentServiceTest {
     @Mock private AcademicSessionRepository academicSessionRepository;
     @Mock private StudentEnrollmentService studentEnrollmentService;
     @Mock private ParentPortalService parentPortalService;
+    @Mock private StudentLoginService studentLoginService;
+    @Mock private StudentMarkRepository studentMarkRepository;
+    @Mock private StudentEnrollmentRepository studentEnrollmentRepository;
     @Mock private HttpServletRequest request;
 
     private StudentService service;
@@ -109,6 +114,9 @@ class StudentServiceTest {
         ReflectionTestUtils.setField(service, "academicSessionRepository", academicSessionRepository);
         ReflectionTestUtils.setField(service, "studentEnrollmentService", studentEnrollmentService);
         ReflectionTestUtils.setField(service, "parentPortalService", parentPortalService);
+        ReflectionTestUtils.setField(service, "studentLoginService", studentLoginService);
+        ReflectionTestUtils.setField(service, "studentMarkRepository", studentMarkRepository);
+        ReflectionTestUtils.setField(service, "studentEnrollmentRepository", studentEnrollmentRepository);
         ReflectionTestUtils.setField(service, "clock", Clock.fixed(Instant.parse("2026-09-06T06:00:00Z"), ZoneOffset.UTC));
 
         lenient().when(securityUtil.getSchoolId()).thenReturn(SCHOOL_ID);
@@ -482,6 +490,27 @@ class StudentServiceTest {
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("invalid transition");
         verify(studentRepository, never()).save(any(Student.class));
         verify(studentFeesService, never()).updateStudentFeesForClassChange(any(), any());
+    }
+
+    @Test
+    void anActiveJoiningDateIsNotCorrectedOnceMarksExist() {
+        Student existing = newStudent("S1", "9", null);
+        existing.setSchoolId(SCHOOL_ID); existing.setClassId(9L); existing.setStatus(StudentStatus.ACTIVE);
+        existing.setJoiningDate(TODAY.minusDays(1)); existing.markAsExisting();
+        when(studentRepository.findByStudentIdAndSchoolId("S1", SCHOOL_ID)).thenReturn(Optional.of(existing));
+        when(schoolClassRepository.findBySchoolIdAndName(SCHOOL_ID, "9"))
+                .thenReturn(Optional.of(schoolClass(9L, SCHOOL_ID, "9")));
+        when(studentEnrollmentService.findEffectiveEnrollment(SCHOOL_ID, "S1", 50L, TODAY))
+                .thenReturn(Optional.of(enrollment(9L, null, "9", null)));
+        com.indraacademy.ias_management.entity.StudentMark mark = new com.indraacademy.ias_management.entity.StudentMark();
+        when(studentMarkRepository.findByStudentIdAndSchoolId("S1", SCHOOL_ID)).thenReturn(java.util.List.of(mark));
+        Student update = newStudent("S1", "9", null);
+        update.setJoiningDate(TODAY.minusDays(5));
+
+        assertThatThrownBy(() -> service.updateStudent("S1", update, null, request))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("attendance or marks");
+        verify(studentEnrollmentService, never()).correctActiveStartDate(any(), any(), any());
+        verify(studentRepository, never()).save(any(Student.class));
     }
 
     private StudentEnrollment enrollment(Long classId, Long sectionId, String className, String sectionName) {

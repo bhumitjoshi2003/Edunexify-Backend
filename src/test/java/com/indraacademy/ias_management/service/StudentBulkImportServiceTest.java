@@ -1,13 +1,12 @@
 package com.indraacademy.ias_management.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.indraacademy.ias_management.config.Role;
 import com.indraacademy.ias_management.dto.BulkImportResultDTO;
 import com.indraacademy.ias_management.entity.Student;
-import com.indraacademy.ias_management.entity.User;
+import com.indraacademy.ias_management.entity.SchoolClass;
+import com.indraacademy.ias_management.entity.Section;
 import com.indraacademy.ias_management.repository.SchoolClassRepository;
 import com.indraacademy.ias_management.repository.SectionRepository;
-import com.indraacademy.ias_management.repository.UserRepository;
 import com.indraacademy.ias_management.util.SecurityUtil;
 import jakarta.servlet.http.HttpServletRequest;
 import org.junit.jupiter.api.BeforeEach;
@@ -17,7 +16,6 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.mock.web.MockMultipartFile;
-import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.nio.charset.StandardCharsets;
@@ -53,11 +51,8 @@ class StudentBulkImportServiceTest {
     @Mock private StudentService studentService;
     @Mock private AuditService auditService;
     @Mock private SecurityUtil securityUtil;
-    @Mock private UserRepository userRepository;
-    @Mock private PasswordEncoder passwordEncoder;
     @Mock private SchoolClassRepository schoolClassRepository;
     @Mock private SectionRepository sectionRepository;
-    @Mock private WelcomeEmailService welcomeEmailService;
     @Mock private HttpServletRequest request;
 
     private StudentBulkImportService service;
@@ -71,11 +66,8 @@ class StudentBulkImportServiceTest {
         ReflectionTestUtils.setField(service, "auditService", auditService);
         ReflectionTestUtils.setField(service, "securityUtil", securityUtil);
         ReflectionTestUtils.setField(service, "objectMapper", new ObjectMapper());
-        ReflectionTestUtils.setField(service, "userRepository", userRepository);
-        ReflectionTestUtils.setField(service, "passwordEncoder", passwordEncoder);
         ReflectionTestUtils.setField(service, "schoolClassRepository", schoolClassRepository);
         ReflectionTestUtils.setField(service, "sectionRepository", sectionRepository);
-        ReflectionTestUtils.setField(service, "welcomeEmailService", welcomeEmailService);
 
         lenient().when(securityUtil.getSchoolId()).thenReturn(SCHOOL_ID);
         lenient().when(securityUtil.getUsername()).thenReturn("admin");
@@ -88,7 +80,6 @@ class StudentBulkImportServiceTest {
             s.setStudentId(String.format("stu_260100%02d", seq.getAndIncrement()));
             return s;
         });
-        lenient().when(passwordEncoder.encode(anyString())).thenReturn("ENCODED");
     }
 
     /** New-format CSV — no ID column at all, matching the current (post-generation)
@@ -120,42 +111,13 @@ class StudentBulkImportServiceTest {
     }
 
     @Test
-    void validRowCreatesUserWithDobDerivedPasswordAndMustChangePasswordTrue() {
-        MockMultipartFile file = csv("Valid Student,s1@test.com,,1990-05-23,10,,,,,,,2024-01-01,");
+    void loginIsCreatedByTheCanonicalAdmissionNotSeparately() {
+        // StudentService.addStudent creates student + enrollment + login in one transaction;
+        // the importer only delegates, so there is no second, non-atomic account step.
+        BulkImportResultDTO result = service.bulkImport(csv("Valid Student,s1@test.com,,1990-05-23,10,,,,,,,2024-01-01"), request);
 
-        service.bulkImport(file, request);
-
-        verify(passwordEncoder).encode("19900523");
-
-        ArgumentCaptor<User> userCaptor = ArgumentCaptor.forClass(User.class);
-        verify(userRepository).save(userCaptor.capture());
-        User saved = userCaptor.getValue();
-        assertThat(saved.getUserId()).startsWith("stu_26");
-        assertThat(saved.getRole()).isEqualTo(Role.STUDENT);
-        assertThat(saved.isMustChangePassword()).isTrue();
-        assertThat(saved.getPassword()).isEqualTo("ENCODED");
-    }
-
-    @Test
-    void validRowTriggersWelcomeEmailAfterUserAccountIsCreated() {
-        MockMultipartFile file = csv("Valid Student,s1@test.com,,1990-05-23,10,,,,,,,2024-01-01,");
-
-        service.bulkImport(file, request);
-
-        ArgumentCaptor<String> studentIdCaptor = ArgumentCaptor.forClass(String.class);
-        verify(welcomeEmailService).sendWelcomeEmail(studentIdCaptor.capture(), org.mockito.Mockito.eq("Valid Student"),
-                org.mockito.Mockito.eq(Role.STUDENT), org.mockito.Mockito.eq("s1@test.com"), org.mockito.Mockito.eq(SCHOOL_ID));
-        assertThat(studentIdCaptor.getValue()).startsWith("stu_26");
-    }
-
-    @Test
-    void rowMissingDobDoesNotTriggerWelcomeEmail() {
-        MockMultipartFile file = csv("No Dob Student,s2@test.com,,,10,,,,,,,2024-01-01,");
-
-        service.bulkImport(file, request);
-
-        verify(welcomeEmailService, org.mockito.Mockito.never())
-                .sendWelcomeEmail(anyString(), anyString(), anyString(), anyString(), any());
+        assertThat(result.getSuccessful()).isEqualTo(1);
+        verify(studentService).addStudent(any(Student.class), org.mockito.Mockito.eq(request));
     }
 
     @Test
@@ -202,16 +164,108 @@ class StudentBulkImportServiceTest {
     }
 
     @Test
-    void canonicalCreationFailureIsRowScopedAndDoesNotCreateAccountOrWelcomeEmail() {
+    void canonicalCreationFailureIsRowScoped() {
         doThrow(new IllegalArgumentException("No configured academic session contains joining date"))
                 .when(studentService).addStudent(any(Student.class), any());
 
         BulkImportResultDTO result = service.bulkImport(
-                csv("Bad Session,s1@test.com,,1990-05-23,10,,,,,,,2035-01-01,"), request);
+                csv("Bad Session,s1@test.com,,1990-05-23,10,,,,,,,2035-01-01"), request);
 
         assertThat(result.getSuccessful()).isZero();
         assertThat(result.getFailed()).isEqualTo(1);
-        verify(userRepository, never()).save(any());
-        verify(welcomeEmailService, never()).sendWelcomeEmail(anyString(), anyString(), anyString(), anyString(), any());
+    }
+
+    @Test
+    void aLoginFailureRejectsOnlyThatRow_otherRowsStillImport() {
+        AtomicInteger seq = new AtomicInteger(1);
+        when(studentService.addStudent(any(Student.class), any())).thenAnswer(inv -> {
+            Student s = inv.getArgument(0);
+            if (s.getName().equals("Login Clash")) {
+                // Thrown inside the admission transaction, which then rolls the whole row back.
+                throw new IllegalStateException("A login already exists for student stu_x.");
+            }
+            s.setStudentId("stu_ok" + seq.getAndIncrement());
+            return s;
+        });
+
+        BulkImportResultDTO result = service.bulkImport(csv(
+                "Login Clash,a@test.com,,1990-05-23,10,,,,,,,2024-01-01",
+                "Fine Student,b@test.com,,1991-05-23,10,,,,,,,2024-01-01"), request);
+
+        assertThat(result.getSuccessful()).isEqualTo(1);
+        assertThat(result.getFailed()).isEqualTo(1);
+        assertThat(result.getErrors().get(0).getReason()).contains("login already exists");
+        assertThat(result.getErrors().get(0).getRow()).isEqualTo(2);
+    }
+
+    @Test
+    void anUnknownSectionIsARowErrorAndIsNeverSilentlyDropped() {
+        SchoolClass ten = new SchoolClass();
+        ten.setId(10L);
+        ten.setName("10");
+        when(schoolClassRepository.findBySchoolIdAndName(SCHOOL_ID, "10")).thenReturn(Optional.of(ten));
+        when(sectionRepository.findBySchoolIdAndClassIdAndName(SCHOOL_ID, 10L, "Z")).thenReturn(Optional.empty());
+
+        BulkImportResultDTO result = service.bulkImport(
+                csv("Section Typo,s1@test.com,,1990-05-23,10,Z,,,,,,2024-01-01"), request);
+
+        assertThat(result.getSuccessful()).isZero();
+        assertThat(result.getErrors().get(0).getReason()).isEqualTo("Section 'Z' does not exist for class '10'");
+        verify(studentService, never()).addStudent(any(Student.class), any());
+    }
+
+    @Test
+    void aKnownSectionIsAssigned() {
+        SchoolClass ten = new SchoolClass();
+        ten.setId(10L);
+        ten.setName("10");
+        Section a = new Section();
+        a.setId(101L);
+        a.setName("A");
+        when(schoolClassRepository.findBySchoolIdAndName(SCHOOL_ID, "10")).thenReturn(Optional.of(ten));
+        when(sectionRepository.findBySchoolIdAndClassIdAndName(SCHOOL_ID, 10L, "A")).thenReturn(Optional.of(a));
+
+        service.bulkImport(csv("Has Section,s1@test.com,,1990-05-23,10,A,,,,,,2024-01-01"), request);
+
+        ArgumentCaptor<Student> captor = ArgumentCaptor.forClass(Student.class);
+        verify(studentService).addStudent(captor.capture(), any());
+        assertThat(captor.getValue().getSectionId()).isEqualTo(101L);
+    }
+
+    @Test
+    void aLeavingDateIsRejectedForANewAdmission() {
+        MockMultipartFile legacyTemplate = new MockMultipartFile("file", "students.csv", "text/csv",
+                ("Student Name,Email,Phone Number,Date of Birth,Class,Section,Gender,Father Name,Mother Name,Takes Bus,Distance (km),Joining Date,Leaving Date\n"
+                        + "Already Left,s1@test.com,,1990-05-23,10,,,,,,,2024-01-01,2024-06-01\n"
+                        + "No Exit,s2@test.com,,1991-05-23,10,,,,,,,2024-01-01,\n")
+                        .getBytes(StandardCharsets.UTF_8));
+
+        BulkImportResultDTO result = service.bulkImport(legacyTemplate, request);
+
+        assertThat(result.getSuccessful()).isEqualTo(1);
+        assertThat(result.getErrors()).singleElement().satisfies(e -> {
+            assertThat(e.getRow()).isEqualTo(2);
+            assertThat(e.getReason()).contains("Leaving Date must be empty");
+        });
+    }
+
+    @Test
+    void theTemplateNoLongerOffersALeavingDateColumn() {
+        assertThat(StudentBulkImportService.TEMPLATE_HEADERS).doesNotContain("Leaving Date");
+    }
+
+    @Test
+    void aSecondRowWithTheSameNameAndDobInOneFileIsRejected() {
+        BulkImportResultDTO result = service.bulkImport(csv(
+                "Asha Rao,a@test.com,,2012-02-03,10,,,,,,,2024-01-01",
+                "Ravi Kumar,r@test.com,,2012-02-03,10,,,,,,,2024-01-01",
+                "  asha rao ,other@test.com,,2012-02-03,10,,,,,,,2024-01-01"), request);
+
+        assertThat(result.getSuccessful()).isEqualTo(2);
+        assertThat(result.getErrors()).singleElement().satisfies(e -> {
+            assertThat(e.getRow()).isEqualTo(4);
+            assertThat(e.getReason()).isEqualTo("Duplicate of row 2 (same name and date of birth) — not imported");
+        });
+        verify(studentService, org.mockito.Mockito.times(2)).addStudent(any(Student.class), any());
     }
 }

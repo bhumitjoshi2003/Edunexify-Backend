@@ -70,6 +70,7 @@ class StudentLifecyclePostgresIT {
     @MockBean AuditService auditService;
     @MockBean EntitlementService entitlementService;
     @MockBean ParentPortalService parentPortalService;
+    @MockBean StudentLoginService studentLoginService;
     @MockBean IdGeneratorService idGeneratorService;
     @MockBean ObjectMapper objectMapper;
     final HttpServletRequest request=mock(HttpServletRequest.class);
@@ -146,8 +147,9 @@ class StudentLifecyclePostgresIT {
         studentService.exitStudent(STUDENT,exit("GRADUATED",TODAY),request);
         assertThatThrownBy(()->studentService.exitStudent(STUDENT,exit("GRADUATED",TODAY),request))
                 .isInstanceOf(IllegalStateException.class);
+        // Phase 1: a readmission must start after the leaving date (here the same day).
         assertThatThrownBy(()->studentService.readmitStudent(STUDENT,request))
-                .isInstanceOf(IllegalStateException.class).hasMessageContaining("conflicts");
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("after the leaving date");
         assertThatThrownBy(()->enrollmentService.createForExplicitReadmission(
                 SCHOOL,STUDENT,SESSION,OTHER_CLASS,null,TODAY))
                 .isInstanceOf(java.util.NoSuchElementException.class).hasMessageContaining("Class");

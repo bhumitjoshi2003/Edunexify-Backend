@@ -6,13 +6,15 @@ public enum StudentStatus {
     UPCOMING,
     GRADUATED,     // Completed final class (passed out)
     TRANSFERRED,   // Left to join another school
-    WITHDRAWN;     // Left mid-year (dropout, family decision, relocation, etc.)
+    WITHDRAWN,     // Left mid-year (dropout, family decision, relocation, etc.)
+    ADMISSION_CANCELLED; // Admitted for a future date but cancelled before ever joining
 
     /**
      * Returns true for terminal exit statuses that the scheduler and
      * calculateStatus() must never overwrite.
      */
     public boolean isExitStatus() {
-        return this == GRADUATED || this == TRANSFERRED || this == WITHDRAWN || this == INACTIVE;
+        return this == GRADUATED || this == TRANSFERRED || this == WITHDRAWN || this == INACTIVE
+                || this == ADMISSION_CANCELLED;
     }
 }

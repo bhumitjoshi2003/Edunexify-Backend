@@ -52,6 +52,7 @@ class StudentAdmissionPostgresIT {
     @MockBean AuditService auditService;
     @MockBean EntitlementService entitlementService;
     @MockBean ParentPortalService parentPortalService;
+    @MockBean StudentLoginService studentLoginService;
     @MockBean IdGeneratorService idGeneratorService;
     @MockBean ObjectMapper objectMapper;
 

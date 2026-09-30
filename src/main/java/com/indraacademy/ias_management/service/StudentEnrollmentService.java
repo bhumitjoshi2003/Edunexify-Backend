@@ -636,6 +636,133 @@ public class StudentEnrollmentService {
         return new LifecycleMutation(student, active, false, null);
     }
 
+    /**
+     * Moves an UPCOMING student's not-yet-started admission to a new joining date. The row has
+     * never been effective, so changing its date (and, when the new date falls in another
+     * current/future session, its session) rewrites no history. A new date of today or earlier
+     * (inside a session that has not ended) starts the admission now: the row becomes ACTIVE and
+     * the Student projection is synchronized, exactly as the scheduler would have done.
+     * Year-end continuing targets are rollover-owned and are never moved here.
+     */
+    @Transactional
+    public StudentEnrollment reschedulePlannedAdmission(Long schoolId, String studentId, LocalDate newDate) {
+        if (newDate == null) throw new IllegalArgumentException("Joining date is required");
+        Student student = lockStudent(schoolId, studentId, true);
+        if (student.getStatus() != StudentStatus.UPCOMING) {
+            throw new IllegalStateException("Only an upcoming admission can be rescheduled");
+        }
+        List<StudentEnrollment> history = enrollmentRepository.findAllHistoryForUpdate(schoolId, studentId);
+        StudentEnrollment planned = requireSingleUnstartedAdmission(schoolId, history);
+        LocalDate today = schoolToday(schoolId);
+        AcademicSession target = requireCurrentOrFutureSessionContaining(schoolId, newDate, today);
+        validateMembership(schoolId, planned.getClassId(), planned.getSectionId());
+        List<StudentEnrollment> others = history.stream()
+                .filter(e -> !Objects.equals(e.getId(), planned.getId()))
+                .filter(e -> Objects.equals(e.getAcademicSessionId(), target.getId()))
+                .toList();
+        ensureNoEnrollmentConflict(others, newDate, null);
+
+        planned.setAcademicSessionId(target.getId());
+        planned.setEffectiveFrom(newDate);
+        if (!newDate.isAfter(today)) {
+            planned.setStatus(StudentEnrollmentStatus.ACTIVE);
+            StudentEnrollment active = enrollmentRepository.saveAndFlush(planned);
+            synchronizeProjection(student, active);
+            student.setStatus(StudentStatus.ACTIVE);
+            studentRepository.save(student);
+            return active;
+        }
+        return enrollmentRepository.saveAndFlush(planned);
+    }
+
+    /**
+     * Cancels an UPCOMING student's admission before it starts, using the existing
+     * CANCELLED_BEFORE_START lifecycle (the row is kept, never deleted). Returns the cancelled
+     * row, or null for a legacy upcoming student with no enrollment history.
+     */
+    @Transactional
+    public StudentEnrollment cancelPlannedAdmission(Long schoolId, String studentId) {
+        Student student = lockStudent(schoolId, studentId, true);
+        if (student.getStatus() != StudentStatus.UPCOMING) {
+            throw new IllegalStateException("Only an upcoming admission that has not started can be cancelled");
+        }
+        List<StudentEnrollment> history = enrollmentRepository.findAllHistoryForUpdate(schoolId, studentId);
+        if (history.stream().noneMatch(e -> e.getStatus() != StudentEnrollmentStatus.CANCELLED)) {
+            return null;
+        }
+        StudentEnrollment planned = requireSingleUnstartedAdmission(schoolId, history);
+        planned.setStatus(StudentEnrollmentStatus.CANCELLED);
+        planned.setEffectiveUntil(planned.getEffectiveFrom());
+        planned.setClosureReason(StudentEnrollmentClosureReason.CANCELLED_BEFORE_START);
+        return enrollmentRepository.saveAndFlush(planned);
+    }
+
+    /**
+     * Corrects the start date of a student's only enrollment. The caller must first prove no
+     * attendance or marks exist; this method additionally requires that the student has exactly
+     * one non-cancelled enrollment (open and ACTIVE), and that the new date stays inside the same
+     * session and is not in the future — so no other lifecycle history can be affected.
+     */
+    @Transactional
+    public StudentEnrollment correctActiveStartDate(Long schoolId, String studentId, LocalDate newDate) {
+        if (newDate == null) throw new IllegalArgumentException("Joining date is required");
+        Student student = lockStudent(schoolId, studentId, true);
+        List<StudentEnrollment> realized = enrollmentRepository.findAllHistoryForUpdate(schoolId, studentId).stream()
+                .filter(e -> e.getStatus() != StudentEnrollmentStatus.CANCELLED)
+                .toList();
+        if (realized.size() != 1 || realized.getFirst().getStatus() != StudentEnrollmentStatus.ACTIVE
+                || realized.getFirst().getEffectiveUntil() != null) {
+            throw new IllegalStateException("The joining date can only be corrected for a student whose only "
+                    + "enrollment is the current one. This student has other enrollment history.");
+        }
+        StudentEnrollment active = realized.getFirst();
+        AcademicSession session = requireSession(schoolId, active.getAcademicSessionId());
+        if (newDate.isBefore(session.getStartDate()) || newDate.isAfter(session.getEndDate())) {
+            throw new IllegalArgumentException("The corrected joining date must stay inside the "
+                    + session.getLabel() + " academic session.");
+        }
+        if (newDate.isAfter(schoolToday(schoolId))) {
+            throw new IllegalArgumentException("An active student's joining date cannot be moved into the future.");
+        }
+        active.setEffectiveFrom(newDate);
+        StudentEnrollment corrected = enrollmentRepository.saveAndFlush(active);
+        student.setJoiningDate(newDate);
+        studentRepository.save(student);
+        return corrected;
+    }
+
+    /** The one never-effective admission row of an upcoming student; anything else fails safely. */
+    private StudentEnrollment requireSingleUnstartedAdmission(Long schoolId, List<StudentEnrollment> history) {
+        List<StudentEnrollment> realized = history.stream()
+                .filter(e -> e.getStatus() != StudentEnrollmentStatus.CANCELLED)
+                .toList();
+        if (realized.size() != 1 || realized.getFirst().getStatus() != StudentEnrollmentStatus.PLANNED) {
+            throw new IllegalStateException("This student does not have a single upcoming admission that can be changed.");
+        }
+        StudentEnrollment planned = realized.getFirst();
+        if (!planned.getEffectiveFrom().isAfter(schoolToday(schoolId))) {
+            throw new IllegalStateException("This admission has already started.");
+        }
+        return planned;
+    }
+
+    private AcademicSession requireCurrentOrFutureSessionContaining(Long schoolId, LocalDate date, LocalDate today) {
+        List<AcademicSession> matches = sessionRepository
+                .findAllBySchoolIdAndStartDateLessThanEqualAndEndDateGreaterThanEqual(schoolId, date, date);
+        if (matches.isEmpty()) {
+            throw new IllegalArgumentException("No configured academic session contains " + date + ".");
+        }
+        if (matches.size() > 1) {
+            throw new IllegalStateException("Multiple academic sessions contain " + date + ".");
+        }
+        AcademicSession session = matches.getFirst();
+        if (session.getEndDate().isBefore(today)) {
+            throw new IllegalArgumentException(date + " belongs to a past academic session (" + session.getLabel()
+                    + "). Choose a date in the current or a future session.");
+        }
+        return session;
+    }
+
     @Transactional(readOnly = true)
     public ProjectionConsistency checkProjectionConsistency(
             Long schoolId, String studentId, Long sessionId) {

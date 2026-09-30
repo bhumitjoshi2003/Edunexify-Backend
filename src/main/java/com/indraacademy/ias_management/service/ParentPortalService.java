@@ -240,6 +240,61 @@ public class ParentPortalService {
                 });
     }
 
+    /**
+     * Parent links that ended between {@code since} (the student's last exit) and {@code until}
+     * (the readmission date), whose parent account is still active — candidates an admin may
+     * choose to restore after readmission. Links an admin removed before the exit or after the
+     * readmission are not offered. Empty when the portal is not enabled.
+     */
+    @Transactional(readOnly = true)
+    public List<com.indraacademy.ias_management.dto.StudentAdmissionDtos.RestorableParentLink> endedLinksSince(
+            Long schoolId, String studentId, LocalDate since, LocalDate until) {
+        if (since == null || until == null || !entitlementService.hasFeature(schoolId, "PARENT_PORTAL")) return List.of();
+        return relationshipRepository.findBySchoolIdAndStudentIdOrderByPrimaryGuardianDesc(schoolId, studentId).stream()
+                .filter(link -> !link.isActive())
+                .filter(link -> link.getEffectiveUntil() != null && !link.getEffectiveUntil().isBefore(since)
+                        && !link.getEffectiveUntil().isAfter(until))
+                .flatMap(link -> parentRepository.findByParentIdAndSchoolId(link.getParentId(), schoolId)
+                        .filter(Parent::isActive)
+                        .map(parent -> new com.indraacademy.ias_management.dto.StudentAdmissionDtos.RestorableParentLink(
+                                link.getId(), parent.getParentId(), parent.getName(), link.getRelationshipType(),
+                                link.isPrimaryGuardian(), link.getEffectiveUntil()))
+                        .stream())
+                .toList();
+    }
+
+    /**
+     * Restores exactly the links an admin confirmed. Each must belong to this student and school,
+     * be one of {@link #endedLinksSince}'s candidates, and the student must be enrolled again.
+     */
+    @Transactional
+    public int restoreLinks(Long schoolId, String studentId, LocalDate since, LocalDate until, List<Long> relationshipIds) {
+        requireFeature(schoolId);
+        if (relationshipIds == null || relationshipIds.isEmpty()) return 0;
+        Student student = studentRepository.findByStudentIdAndSchoolId(studentId, schoolId)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Student not found"));
+        if (student.getStatus() != null && student.getStatus().isExitStatus()) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Parent access can only be restored for an enrolled student");
+        }
+        java.util.Set<Long> allowed = endedLinksSince(schoolId, studentId, since, until).stream()
+                .map(com.indraacademy.ias_management.dto.StudentAdmissionDtos.RestorableParentLink::relationshipId)
+                .collect(java.util.stream.Collectors.toSet());
+        int restored = 0;
+        for (Long id : new java.util.LinkedHashSet<>(relationshipIds)) {
+            if (!allowed.contains(id)) {
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Parent link " + id + " can't be restored for this student");
+            }
+            ParentStudentRelationship link = relationshipRepository.findByIdAndSchoolId(id, schoolId)
+                    .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Parent/student link not found"));
+            link.setActive(true);
+            link.setEffectiveFrom(LocalDate.now());
+            link.setEffectiveUntil(null);
+            relationshipRepository.save(link);
+            restored++;
+        }
+        return restored;
+    }
+
     @Transactional
     public void unlinkStudent(String parentId, Long relationshipId) {
         Long schoolId = schoolId();

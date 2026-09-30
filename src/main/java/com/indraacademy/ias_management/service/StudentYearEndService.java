@@ -27,6 +27,9 @@ public class StudentYearEndService {
     private final SectionRepository sections;
     private final StudentEnrollmentRepository enrollments;
     private final ParentPortalService parentPortal;
+    /** Optional so narrow tests can build this service; present in the application. */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private StudentLoginService studentLogin;
     private final AuditService auditService;
     private final Clock clock;
 
@@ -212,6 +215,8 @@ public class StudentYearEndService {
         }
         students.saveAndFlush(student);
         parentPortal.endRelationshipsForExitedStudent(schoolId, studentId, source.getEffectiveUntil());
+        // The transfer is now effective: the student loses login access (a graduate keeps it).
+        if (studentLogin != null) studentLogin.deactivate(schoolId, studentId);
         audit(auditContext, "FINALIZE_YEAR_END_" + exitStatus.name(), studentId, "ACTIVE", exitStatus.name());
         return result(Outcome.TRANSFERRED, "Transfer finalized", source.getId(), null, false);
     }

@@ -38,6 +38,7 @@ import org.springframework.web.multipart.MultipartFile;
 
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDate;
+import com.indraacademy.ias_management.dto.StudentAdmissionDtos;
 import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
@@ -74,11 +75,11 @@ public class StudentController {
 
     @PreAuthorize("hasRole('" + Role.ADMIN + "')")
     @PostMapping
-    public ResponseEntity<?> registerStudent(@Valid @RequestBody Student newStudent, HttpServletRequest request) {
-        // Edunexify always generates the Student ID for a brand-new account — any studentId
-        // sent by the client (a stale UI build, a direct API call, etc.) is discarded here,
-        // never trusted. StudentService.addStudent() generates a fresh one for a blank ID.
-        newStudent.setStudentId(null);
+    public ResponseEntity<?> registerStudent(@Valid @RequestBody StudentAdmissionDtos.AdmissionRequest newStudent,
+                                             HttpServletRequest request) {
+        // Only admin-editable fields are bound (StudentAdmissionDtos.AdmissionRequest): the Student
+        // ID is always generated, and status, school, exit details and photo can't be sent. The
+        // student, enrollment and login are created in one transaction.
         log.info("Request to register new student.");
         try {
             Student savedStudent = studentService.addStudent(newStudent, request);
@@ -119,6 +120,15 @@ public class StudentController {
         }
 
         Optional<Student> student = studentService.getStudent(resolvedStudentId);
+        if (Role.TEACHER.equals(role) && student.isPresent()) {
+            // A teacher may open only a student of the class/section they are responsible for —
+            // the same rule every other per-student teacher endpoint already applies.
+            ScopedAccess access = teacherClassScopeService.authorizeAndScopeToStudent(role, authService.getUserId(),
+                    securityUtil.getSchoolId(), student.get().getClassName(), student.get().getSectionId());
+            if (!access.allowed()) {
+                throw new org.springframework.security.access.AccessDeniedException(access.errorMessage());
+            }
+        }
         student.ifPresent(this::resolvePhotoUrlForDisplay);
         return student.map(ResponseEntity::ok)
                 .orElseGet(() -> {
@@ -142,17 +152,20 @@ public class StudentController {
 
     @PreAuthorize("hasRole('" + Role.ADMIN + "')")
     @PutMapping("/{studentId}")
-    public ResponseEntity<Student> updateStudent(@PathVariable String studentId, @RequestBody Map<String, Object> requestBody, HttpServletRequest request) {
+    public ResponseEntity<Student> updateStudent(@PathVariable String studentId,
+                                                 @Valid @RequestBody StudentAdmissionDtos.UpdateEnvelope requestBody,
+                                                 HttpServletRequest request) {
         log.info("Request to update student details for ID: {}", studentId);
-        Student updatedStudent = objectMapper.convertValue(requestBody.get("studentDetails"), Student.class);
-        Integer effectiveFromMonth = (Integer) requestBody.get("effectiveFromMonth");
-
-        if (updatedStudent == null) {
+        // Only admin-editable fields bind; anything else a client sends back (status, photoUrl —
+        // including a short-lived signed URL from a GET — exit details) is ignored.
+        if (requestBody == null || requestBody.studentDetails() == null) {
             log.warn("Update student failed: Missing studentDetails");
             return ResponseEntity.badRequest().build();
         }
 
-        Student savedStudent = studentService.updateStudent(studentId, updatedStudent, effectiveFromMonth, request);
+        Student savedStudent = studentService.updateStudent(studentId, requestBody.studentDetails(),
+                requestBody.effectiveFromMonth(), request);
+        resolvePhotoUrlForDisplay(savedStudent);
         log.info("Student updated successfully with ID: {}", studentId);
         return ResponseEntity.ok(savedStudent);
     }
@@ -398,16 +411,74 @@ public class StudentController {
     @PostMapping("/{studentId}/readmit")
     public ResponseEntity<?> readmitStudent(
             @PathVariable String studentId,
+            @RequestBody(required = false) StudentAdmissionDtos.ReadmitRequest choice,
             HttpServletRequest httpRequest) {
         log.warn("Request to re-admit student: {}", studentId);
         try {
-            Student student = studentService.readmitStudent(studentId, httpRequest);
+            Student student = studentService.readmitStudent(studentId, choice, httpRequest);
             return ResponseEntity.ok(student);
         } catch (NoSuchElementException e) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(e.getMessage());
-        } catch (IllegalStateException e) {
+        } catch (IllegalStateException | IllegalArgumentException e) {
             return ResponseEntity.badRequest().body(e.getMessage());
         }
+    }
+
+    @PreAuthorize("hasRole('" + Role.ADMIN + "')")
+    @PostMapping("/{studentId}/cancel-admission")
+    public ResponseEntity<?> cancelAdmission(
+            @PathVariable String studentId,
+            @Valid @RequestBody(required = false) StudentAdmissionDtos.CancelAdmissionRequest body,
+            HttpServletRequest httpRequest) {
+        log.warn("Request to cancel admission of student: {}", studentId);
+        try {
+            return ResponseEntity.ok(studentService.cancelAdmission(studentId, body == null ? null : body.reason(), httpRequest));
+        } catch (NoSuchElementException e) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(e.getMessage());
+        } catch (IllegalStateException | IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(e.getMessage());
+        }
+    }
+
+    @PreAuthorize("hasRole('" + Role.ADMIN + "')")
+    @GetMapping("/{studentId}/login")
+    public StudentAdmissionDtos.LoginStatus loginStatus(@PathVariable String studentId) {
+        return studentService.loginStatus(studentId);
+    }
+
+    @PreAuthorize("hasRole('" + Role.ADMIN + "')")
+    @PostMapping("/{studentId}/login")
+    public ResponseEntity<?> createMissingLogin(@PathVariable String studentId, HttpServletRequest httpRequest) {
+        try {
+            return ResponseEntity.status(HttpStatus.CREATED).body(studentService.createMissingLogin(studentId, httpRequest));
+        } catch (NoSuchElementException e) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(e.getMessage());
+        } catch (IllegalStateException e) {
+            return ResponseEntity.status(HttpStatus.CONFLICT).body(e.getMessage());
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(e.getMessage());
+        }
+    }
+
+    @PreAuthorize("hasRole('" + Role.ADMIN + "')")
+    @GetMapping("/{studentId}/enrollments")
+    public List<StudentAdmissionDtos.EnrollmentHistoryItem> enrollmentHistory(@PathVariable String studentId) {
+        return studentService.enrollmentHistory(studentId);
+    }
+
+    @PreAuthorize("hasRole('" + Role.ADMIN + "')")
+    @GetMapping("/{studentId}/restorable-parent-links")
+    public List<StudentAdmissionDtos.RestorableParentLink> restorableParentLinks(@PathVariable String studentId) {
+        return studentService.restorableParentLinks(studentId);
+    }
+
+    @PreAuthorize("hasRole('" + Role.ADMIN + "')")
+    @PostMapping("/{studentId}/restore-parent-links")
+    public Map<String, Integer> restoreParentLinks(@PathVariable String studentId,
+                                                   @RequestBody StudentAdmissionDtos.RestoreParentLinksRequest body,
+                                                   HttpServletRequest httpRequest) {
+        return Map.of("restored", studentService.restoreParentLinks(studentId,
+                body == null ? List.of() : body.relationshipIds(), httpRequest));
     }
 
 }

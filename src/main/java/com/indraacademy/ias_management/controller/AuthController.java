@@ -175,7 +175,17 @@ public class AuthController {
                     .body("Only a SUPER_ADMIN can create a SUPER_ADMIN account.");
         }
 
-        if (userRepository.findByUserId(user.getUserId()).isPresent()) {
+        Optional<User> existingAccount = userRepository.findByUserId(user.getUserId());
+        if (existingAccount.isPresent()) {
+            // Student admission now creates the login in the same transaction. An older client
+            // still makes this second call afterwards; for the caller's own school's student that
+            // already has its login, report success instead of a misleading "account setup failed".
+            User existing = existingAccount.get();
+            if (Role.STUDENT.equals(user.getRole()) && Role.STUDENT.equals(existing.getRole())
+                    && !callerIsSuperAdmin && SchoolContext.get() != null
+                    && SchoolContext.get().equals(existing.getSchoolId())) {
+                return ResponseEntity.ok("User registered successfully");
+            }
             return ResponseEntity.status(HttpStatus.CONFLICT).body("User ID already exists.");
         }
 
