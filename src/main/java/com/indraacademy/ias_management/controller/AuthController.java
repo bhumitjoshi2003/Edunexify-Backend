@@ -747,6 +747,14 @@ public class AuthController {
         }
     }
 
+    /**
+     * Changes a password. A user changing their own password must supply the current one. An
+     * ADMIN may set the password of a non-admin user of their OWN school only (a user of another
+     * school is reported exactly like an unknown user); a SUPER_ADMIN keeps platform-wide reach.
+     * An admin-set password revokes every session of the target and forces them to choose a new
+     * password at their next login. All of it commits together or not at all.
+     */
+    @Transactional
     @PostMapping("/change-password")
     public ResponseEntity<?> changePassword(@Valid @RequestBody ChangePasswordRequest request) {
 
@@ -774,6 +782,18 @@ public class AuthController {
             if (!"ADMIN".equals(callingUserRole) && !"SUPER_ADMIN".equals(callingUserRole)) {
                 return ResponseEntity.status(HttpStatus.FORBIDDEN)
                         .body("Access Denied: You cannot change other users' passwords.");
+            }
+
+            // Tenant isolation: an ADMIN may only act on users of their own school. Checked before
+            // anything role-specific, and answered exactly like an unknown user, so nothing about
+            // another school's accounts (existence, role) is revealed.
+            if ("ADMIN".equals(callingUserRole)) {
+                Long callerSchoolId = SchoolContext.get();
+                if (callerSchoolId == null || !callerSchoolId.equals(targetUser.getSchoolId())) {
+                    log.warn("Cross-school password change refused: admin {} (school {}) targeted user outside their school",
+                            callingUserId, callerSchoolId);
+                    return ResponseEntity.status(HttpStatus.NOT_FOUND).body("Target user not found");
+                }
             }
 
             // Regular ADMINs cannot touch other ADMINs or SUPER_ADMINs
@@ -808,11 +828,29 @@ public class AuthController {
         // Save New Password
         try {
             targetUser.setPassword(passwordEncoder.encode(request.getNewPassword()));
-            userRepository.save(targetUser);
+            if (!isSelfUpdate) {
+                // An admin-chosen password is temporary: the user must pick their own at next login.
+                targetUser.setMustChangePassword(true);
+            }
+            // Flushed first: the session revocation below is a bulk update that clears the
+            // persistence context, which would otherwise discard this unflushed change.
+            userRepository.saveAndFlush(targetUser);
+            if (!isSelfUpdate) {
+                // Every existing session (access + refresh) of the target stops working at once.
+                userSessionService.revokeAllForUser(targetUserId);
+                auditService.log(callingUserId, callingUserRole, "ADMIN_CHANGE_PASSWORD", "User", targetUserId,
+                        null, "Password set by admin; sessions revoked; mustChangePassword=true", null);
+            }
 
             log.info("Password successfully updated for user {}", targetUserId);
             return ResponseEntity.ok("Password changed successfully");
         } catch (Exception e) {
+            // Nothing may be half-applied: undo the password, flag and revocation together.
+            try {
+                org.springframework.transaction.interceptor.TransactionAspectSupport.currentTransactionStatus().setRollbackOnly();
+            } catch (org.springframework.transaction.NoTransactionException ignored) {
+                // Called outside a transactional proxy (plain unit construction) — nothing to roll back.
+            }
             log.error("Database error during password update for {}: {}", targetUserId, e.getMessage());
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body("Failed to update password.");
         }
